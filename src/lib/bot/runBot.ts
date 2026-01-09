@@ -213,7 +213,7 @@ async function notifyAgentOutbox(supabase: any, agent: any, lead: any, lastUserT
     },
   };
 
-  await saveOutboxToBotRuns(supabase, lead.id, payload, process.env.OPENAI_MODEL ?? null);
+  await saveOutboxToBotRuns(supabase, lead.id, payload, process.env.OPENAI_MODEL  || undefined);
 }
 
 export async function runBotForIncomingMessage({
