@@ -116,6 +116,19 @@ function wantsPublicationLink(t: string) {
   );
 }
 
+function wantsAnotherOption(t: string) {
+  const s = t
+    .toLowerCase()
+    .replace(/[!¡?.:,;]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Typical phrases: "quiero ver otro", "otra opción", "siguiente", "mostrame más".
+  if (/\b(siguiente|otra|otro|alternativa|mas opciones|más opciones)\b/.test(s)) return true;
+  if (/\b(quiero|mostrame|pasame|ver)\b.*\b(otro|otra|siguiente|alternativa)\b/.test(s)) return true;
+  return false;
+}
+
 function looksLikeNewSearchIntent(t: string) {
   const s = t.toLowerCase();
   if (looksLikeThanksOrAck(s)) return false;
@@ -617,6 +630,53 @@ export async function runBotForIncomingMessage({
     if (sv.permalink) {
       return { decision: "share_publication_link", replyText: `Acá tenés la publicación: ${sv.permalink}` };
     }
+  }
+
+  // "Otro" / "siguiente" option handling.
+  // Without this, users who reply "quiero ver otro" can get stuck seeing the same list again.
+  if (wantsAnotherOption(incomingText)) {
+    const prev = Array.isArray(lead0.last_vehicle_suggestions)
+      ? (lead0.last_vehicle_suggestions as VehicleSuggestion[])
+      : [];
+
+    const excludeIds = Array.from(
+      new Set(
+        [
+          ...prev.map((s) => String((s as any)?.id)).filter(Boolean),
+          lead0.selected_vehicle_id ? String(lead0.selected_vehicle_id) : null,
+        ].filter(Boolean) as string[]
+      )
+    );
+
+    const next = await searchVehiclesClosest({ supabase, lead: lead0, limit: 3, excludeIds });
+
+    if (!next.suggestions.length) {
+      return {
+        decision: "no_more_options",
+        replyText:
+          "Ahora mismo no tengo más opciones cercanas en stock con ese presupuesto. Si querés, decime 1–2 modelos que te interesen o si podés estirarte un poco y te paso alternativas.",
+      };
+    }
+
+    const { text, suggestions } = formatVehicleOptions(next.suggestions, next.meta);
+
+    await supabase
+      .from("leads")
+      .update({
+        last_vehicle_suggestions: suggestions,
+        selected_vehicle: null,
+        selected_vehicle_id: null,
+        conversation_state: "AWAITING_CHOICE",
+      })
+      .eq("id", lead0.id);
+
+    return {
+      decision: "show_next_options",
+      replyText:
+        suggestions.length === 1
+          ? `${text}\n\nSi querés ver la ficha con fotos, respondé 1.`
+          : `${text}\n\nRespondé 1, 2 o 3 para ver la ficha con fotos de la unidad.`,
+    };
   }
 
   // Used vehicle details flow (sell/trade)

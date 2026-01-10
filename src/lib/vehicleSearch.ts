@@ -130,10 +130,12 @@ export async function searchVehiclesClosest({
   supabase,
   lead,
   limit = 3,
+  excludeIds = [],
 }: {
   supabase: SupabaseClient;
   lead: any;
   limit?: number;
+  excludeIds?: string[];
 }): Promise<SearchResult> {
   const { sell: blueSell } = await getBlueSellRate(supabase, 120);
 
@@ -202,6 +204,12 @@ export async function searchVehiclesClosest({
   } else {
     // No budget: show cheapest first
     suggestions.sort((a, b) => a.price_ars - b.price_ars);
+  }
+
+  // Exclude previously shown vehicles (used for "otro" / pagination)
+  if (Array.isArray(excludeIds) && excludeIds.length) {
+    const ex = new Set(excludeIds.map(String));
+    suggestions = suggestions.filter((s) => !ex.has(String(s.id)));
   }
 
   return {
