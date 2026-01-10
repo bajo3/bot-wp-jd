@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { createAdminClient } from "@/lib/supabaseAdmin";
-import { sendWhatsAppText } from "@/lib/whatsapp";
+import { sendWhatsAppText, sendWhatsAppImage } from "@/lib/whatsapp";
 import { runBotForIncomingMessage } from "@/lib/bot/runBot";
 
 export const runtime = "nodejs";
@@ -156,28 +156,50 @@ export async function POST(req: Request) {
   // correr bot
   const result = await runBotForIncomingMessage({ supabase, lead, incomingText: text });
 
-  if (result?.replyText) {
-    await sendWhatsAppText(phoneE164, result.replyText);
+  const outgoing = result?.outgoing?.length
+    ? result.outgoing
+    : result?.replyText
+      ? [{ type: "text" as const, body: result.replyText }]
+      : [];
 
-    await supabase.from("messages").insert({
-      lead_id: lead.id,
-      direction: "out",
-      text: result.replyText,
-      raw_payload: { decision: result.decision },
-    });
+  if (outgoing.length) {
+    const partsForTraining: string[] = [];
 
-    await supabase
-      .from("leads")
-      .update({ last_bot_message_at: new Date().toISOString() })
-      .eq("id", lead.id);
+    for (const msgOut of outgoing) {
+      if (msgOut.type === "text") {
+        await sendWhatsAppText(phoneE164, msgOut.body);
+        partsForTraining.push(msgOut.body);
+        await supabase.from("messages").insert({
+          lead_id: lead.id,
+          direction: "out",
+          text: msgOut.body,
+          raw_payload: { decision: result?.decision ?? null, type: "text" },
+        });
+      }
 
-    // training example auto
-    await supabase.from("training_examples").insert({
-      lead_id: lead.id,
-      user_message: text,
-      bot_message: result.replyText,
-      extracted: result.extracted ?? null,
-    });
+      if (msgOut.type === "image") {
+        await sendWhatsAppImage(phoneE164, msgOut.link, msgOut.caption);
+        await supabase.from("messages").insert({
+          lead_id: lead.id,
+          direction: "out",
+          text: msgOut.caption ? `[[image]] ${msgOut.caption}` : "[[image]]",
+          raw_payload: { decision: result?.decision ?? null, type: "image", link: msgOut.link },
+        });
+      }
+    }
+
+    await supabase.from("leads").update({ last_bot_message_at: new Date().toISOString() }).eq("id", lead.id);
+
+    // training example auto (store only text parts)
+    const combined = partsForTraining.filter(Boolean).join("\n\n");
+    if (combined) {
+      await supabase.from("training_examples").insert({
+        lead_id: lead.id,
+        user_message: text,
+        bot_message: combined,
+        extracted: result?.extracted ?? null,
+      });
+    }
   }
 
   return NextResponse.json({ ok: true }, { status: 200 });

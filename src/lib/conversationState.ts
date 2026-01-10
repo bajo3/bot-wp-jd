@@ -3,6 +3,10 @@ export type ConversationState =
   | "AWAITING_BUDGET"
   | "AWAITING_CAR"
   | "AWAITING_CHOICE"
+  | "POST_CHOICE"
+  | "AWAITING_FINANCE_INTEREST"
+  | "AWAITING_DOWNPAYMENT"
+  | "AWAITING_TERM"
   | "AWAITING_FINANCE"
   | "AWAITING_TRADE_IN"
   | "HANDED_OFF";
@@ -16,5 +20,6 @@ export function nextQuestionFromMissing(missing: string[]): ConversationState {
 }
 
 export function isTerminal(state?: string | null) {
-  return state === "HANDED_OFF";
+  // HANDED_OFF should not block the conversation; the bot still helps with info/questions.
+  return false;
 }

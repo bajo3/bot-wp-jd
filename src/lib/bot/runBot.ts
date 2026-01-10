@@ -12,11 +12,13 @@
 
 import { searchVehiclesClosest, formatVehicleOptions, type VehicleSuggestion } from "@/lib/vehicleSearch";
 import { getCreditCarQuote } from "@/lib/creditcar";
+import { getBlueSellRate, moneyToARS } from "@/lib/exchangeRate";
 
 type LeadRow = any;
 
 export type BotResult = {
   replyText?: string;
+  outgoing?: Array<{ type: "text"; body: string } | { type: "image"; link: string; caption?: string }>; 
   decision: string;
   extracted?: any;
 };
@@ -45,6 +47,102 @@ function parseChoice(text: string): 1 | 2 | 3 | null {
   const m = text.trim().match(/^([1-3])\b/);
   if (!m) return null;
   return Number(m[1]) as 1 | 2 | 3;
+}
+
+function looksLikeThanksOrAck(t: string) {
+  const s = t.trim().toLowerCase();
+  return (
+    s === "gracias" ||
+    s === "muchas gracias" ||
+    s === "genial" ||
+    s === "joya" ||
+    s === "ok" ||
+    s === "okay" ||
+    s === "dale" ||
+    s === "perfecto" ||
+    s === "listo" ||
+    s === "👍" ||
+    s === "👌"
+  );
+}
+
+function wantsMorePhotos(t: string) {
+  const s = t.toLowerCase();
+  return s.includes("más fotos") || s.includes("mas fotos") || s.includes("otras fotos") || s.includes("fotos") && s.includes("mas");
+}
+
+function wantsPublicationLink(t: string) {
+  const s = t.toLowerCase();
+  return (
+    s.includes("link") ||
+    s.includes("public") ||
+    s.includes("mercado") ||
+    s.includes("ml") ||
+    s.includes("publicación") ||
+    s.includes("publicacion")
+  );
+}
+
+function looksLikeNewSearchIntent(t: string) {
+  const s = t.toLowerCase();
+  if (looksLikeThanksOrAck(s)) return false;
+  if (looksLikeGreetingOnly(s)) return false;
+  if (normalizeYesNo(s)) return false;
+  if (/^\s*[1-3]\b/.test(s)) return false;
+  // Heuristic: a question/request about availability of a model.
+  return /(ten[eé]s|tienen|hay|busco|me interesa|alguna|algún|algun|modelo|auto|camioneta)/.test(s);
+}
+
+function formatKm(km: number | null | undefined) {
+  if (km == null || !Number.isFinite(Number(km))) return null;
+  return Math.round(Number(km)).toLocaleString("es-AR");
+}
+
+function extractMotorAndVersionFromTitle(title: string) {
+  const t = String(title ?? "");
+  // Motor: detect patterns like 1.6, 2.0, 1.4, 2.4
+  const motorMatch = t.match(/\b(\d(?:\.\d)?)\b/);
+  const motor = motorMatch ? motorMatch[1] : null;
+
+  // Version/trim: common Argentine trims (best-effort)
+  const trims = [
+    "highline",
+    "trendline",
+    "comfortline",
+    "exclusive",
+    "dynamique",
+    "privilege",
+    "attractive",
+    "pack",
+    "full",
+    "ltz",
+    "lt",
+    "se",
+    "xe",
+    "xlt",
+    "xle",
+    "xli",
+    "s",
+  ];
+  const lower = t.toLowerCase();
+  const found = trims.find((tr) => new RegExp(`\\b${tr}\\b`, "i").test(lower)) ?? null;
+
+  // Capitalize a bit
+  const version = found ? found.replace(/\b\w/g, (c) => c.toUpperCase()) : null;
+  return { motor, version };
+}
+
+function parseDownpayment(text: string): { value: number | null; isPercent: boolean; currency: "ARS" | "USD" } {
+  const s = text.toLowerCase();
+  const isPercent = /%/.test(s);
+  const currency: "ARS" | "USD" = /usd|u\$s|dolar|dólar/.test(s) ? "USD" : "ARS";
+
+  // Remove separators and get first number
+  const m = s.replace(/\./g, "").match(/(\d{1,3}(?:[\s,]\d{3})+|\d+)(?:\.(\d+))?/);
+  if (!m) return { value: null, isPercent, currency };
+  const n = Number(m[1].replace(/[\s,]/g, ""));
+  if (!Number.isFinite(n)) return { value: null, isPercent, currency };
+  return { value: n, isPercent, currency };
 }
 
 function missingRequired(lead: LeadRow) {
@@ -219,9 +317,15 @@ async function showOptionsAndStore(supabase: any, leadId: string, lead: any) {
     .eq("id", leadId);
 
   return {
-    replyText: `${text}
+    replyText:
+      suggestions.length === 1
+        ? `${text}
 
-¿Cuál te interesa? Respondé 1, 2 o 3.`, suggestions
+Si querés ver la ficha con fotos, respondé 1.`
+        : `${text}
+
+Respondé 1, 2 o 3 para ver la ficha con fotos de la unidad.`,
+    suggestions,
   };
 }
 
@@ -241,34 +345,97 @@ export async function runBotForIncomingMessage({
 }): Promise<BotResult | null> {
   // Refresh lead (we rely on stored suggestions/state)
   const { data: fresh } = await supabase.from("leads").select("*").eq("id", lead.id).single();
-  const lead0 = fresh ?? lead;
+  let lead0 = fresh ?? lead;
 
-  // If already handed off, keep it short
-  if (lead0.conversation_state === "HANDED_OFF") {
-    return { decision: "already_handed_off", replyText: "Perfecto, ya te contacta un asesor." };
+  const isHandedOff = lead0.conversation_state === "HANDED_OFF" || lead0.stage === "handed_off";
+
+  // If the last bot interaction is old, reset the flow (but keep the lead and assigned agent).
+  // This prevents the bot from continuing a stale conversation.
+  try {
+    const maxAgeMin = Number(process.env.BOT_RESET_MINUTES ?? 90);
+    const lastBotAt = lead0.last_bot_message_at ? new Date(String(lead0.last_bot_message_at)).getTime() : null;
+    if (lastBotAt && Number.isFinite(lastBotAt)) {
+      const ageMin = (Date.now() - lastBotAt) / 60000;
+      if (ageMin > maxAgeMin && looksLikeNewSearchIntent(incomingText)) {
+        await supabase
+          .from("leads")
+          .update({
+            conversation_state: "START",
+            last_vehicle_suggestions: null,
+            selected_vehicle: null,
+            selected_vehicle_id: null,
+          })
+          .eq("id", lead0.id);
+        lead0 = {
+          ...lead0,
+          conversation_state: "START",
+          last_vehicle_suggestions: null,
+          selected_vehicle: null,
+          selected_vehicle_id: null,
+        };
+      }
+    }
+  } catch {
+    // ignore reset errors
+  }
+
+  // Courtesy/ack messages: do not push the flow.
+  if (looksLikeThanksOrAck(incomingText)) {
+    const base = "¡De nada!";
+    const extra = isHandedOff
+      ? " Mientras tanto, si querés puedo pasarte más fotos, detalles o un aproximado de cuotas."
+      : " Si querés, decime qué modelo buscás o tu presupuesto y te paso opciones.";
+    return { decision: "courtesy_ack", replyText: `${base}${extra}` };
   }
 
   // Explicit handoff
   if (hasAdvisorKeyword(incomingText)) {
+    // If already handed off, don't reassign. Just acknowledge.
+    if (lead0.assigned_agent_id) {
+      await supabase.from("leads").update({ conversation_state: "HANDED_OFF", stage: "handed_off" }).eq("id", lead0.id);
+      await saveBotRun(supabase, lead0.id, "handoff_keyword_already_assigned");
+      return { decision: "handoff_keyword_already_assigned", replyText: "Dale. Ya hay un asesor asignado, en breve te escribe." };
+    }
+
     const agent = await pickNextAgent(supabase);
     await supabase
       .from("leads")
-      .update({
-        stage: "handed_off",
-        conversation_state: "HANDED_OFF",
-        assigned_agent_id: agent.id,
-      })
+      .update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id })
       .eq("id", lead0.id);
 
     await notifyAgentOutbox(supabase, agent, lead0, incomingText);
     await saveBotRun(supabase, lead0.id, "handoff_keyword");
 
-    return { decision: "handoff_keyword", replyText: "Perfecto. Te derivé con un asesor, ya te escribe." };
+    return { decision: "handoff_keyword", replyText: "Listo. Te derivé con un asesor, ya te escribe." };
   }
 
-  // Choice fast-path: "1" / "2" / "3"
+  // If the user changes the topic/model mid-flow, reset the conversational state so the bot doesn't
+  // continue asking stale questions.
+  if (
+    looksLikeNewSearchIntent(incomingText) &&
+    !["START", "AWAITING_BUDGET", "AWAITING_CAR"].includes(String(lead0.conversation_state))
+  ) {
+    await supabase
+      .from("leads")
+      .update({
+        conversation_state: "START",
+        last_vehicle_suggestions: null,
+        selected_vehicle: null,
+        selected_vehicle_id: null,
+      })
+      .eq("id", lead0.id);
+    lead0 = {
+      ...lead0,
+      conversation_state: "START",
+      last_vehicle_suggestions: null,
+      selected_vehicle: null,
+      selected_vehicle_id: null,
+    };
+  }
+
+  // Choice fast-path: "1" / "2" / "3" (only when we are awaiting a choice)
   const choice = parseChoice(incomingText);
-  if (choice && lead0.last_vehicle_suggestions) {
+  if (choice && lead0.conversation_state === "AWAITING_CHOICE" && lead0.last_vehicle_suggestions) {
     const suggestions = lead0.last_vehicle_suggestions as VehicleSuggestion[];
     const picked = getSuggestionByChoice(suggestions, choice);
     if (picked) {
@@ -278,31 +445,119 @@ export async function runBotForIncomingMessage({
         .update({
           selected_vehicle_id: picked.id,
           selected_vehicle: picked,
-          conversation_state: "AWAITING_FINANCE",
+          conversation_state: "AWAITING_FINANCE_INTEREST",
         })
         .eq("id", lead0.id);
 
       await saveBotRun(supabase, lead0.id, "vehicle_selected", { choice, picked });
 
-      // If finance already known, skip straight to next missing
-      if (!lead0.finance) {
-        return { decision: "ask_finance_after_choice", replyText: "Perfecto. ¿Lo querés financiar o sería contado?" };
-      }
+      // Present a short ficha + 4 photos (from Supabase) and offer a no-commitment financing approximation.
+      const { motor, version } = extractMotorAndVersionFromTitle(picked.title);
+      const yearLine = picked.year ? ` (${picked.year})` : "";
+      const kmLine = formatKm(picked.km) ? `\n- Km: ${formatKm(picked.km)}` : "";
+      const motorLine = motor ? `\n- Motor: ${motor}` : "";
+      const versionLine = version ? `\n- Versión: ${version}` : "";
+      const transLine = picked.transmission ? `\n- Caja: ${String(picked.transmission)}` : "";
+      const colorLine = picked.color ? `\n- Color: ${String(picked.color)}` : "";
+      const priceLine =
+        picked.currency_original === "USD"
+          ? `\n- Precio: USD ${Math.round(picked.price_original).toLocaleString("en-US")} (≈ $ ${Math.round(picked.price_ars).toLocaleString("es-AR")})`
+          : `\n- Precio: $ ${Math.round(picked.price_ars).toLocaleString("es-AR")}`;
 
-      if (!lead0.trade_in) {
-        return { decision: "ask_tradein_after_choice", replyText: "¿Tenés usado para permuta?" };
-      }
+      const card = `✅ ${picked.title}${yearLine}${kmLine}${motorLine}${versionLine}${transLine}${colorLine}${priceLine}`;
+      const pics = Array.isArray(picked.pictures) ? picked.pictures.filter(Boolean) : [];
+      const first4 = pics.slice(0, 4);
 
-      // Ready to handoff
-      const agent = await pickNextAgent(supabase);
-      await supabase
-        .from("leads")
-        .update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id })
-        .eq("id", lead0.id);
+      const outgoing: NonNullable<BotResult["outgoing"]> = [{ type: "text", body: `${card}\n\nTe paso 4 fotos 👇` }];
+      for (const link of first4) outgoing.push({ type: "image", link });
+      outgoing.push({
+        type: "text",
+        body:
+          "Si querés, te hago un aproximado de cuotas (sin compromiso) para que te des una idea. ¿Te lo armo? (sí/no)\n\nSi querés más fotos, escribí: más fotos.",
+      });
 
-      await notifyAgentOutbox(supabase, agent, { ...lead0, selected_vehicle: picked }, incomingText);
-      return { decision: "handoff_after_choice", replyText: "Listo. Te paso con un asesor para coordinar." };
+      return { decision: "vehicle_card_and_photos", outgoing };
     }
+  }
+
+  // If the user asks for more photos and we have a selected vehicle, send all photos.
+  if (wantsMorePhotos(incomingText) && lead0.selected_vehicle) {
+    const sv = lead0.selected_vehicle as VehicleSuggestion;
+    const pics = Array.isArray(sv.pictures) ? sv.pictures.filter(Boolean) : [];
+    if (!pics.length) {
+      return { decision: "no_photos_available", replyText: "Todavía no tengo fotos cargadas de esa unidad." };
+    }
+    const outgoing: NonNullable<BotResult["outgoing"]> = [{ type: "text", body: "Dale, te paso todas las fotos 👇" }];
+    for (const link of pics) outgoing.push({ type: "image", link });
+    return { decision: "send_all_photos", outgoing };
+  }
+
+  // Only share an external publication link if the user explicitly asks.
+  if (wantsPublicationLink(incomingText) && lead0.selected_vehicle) {
+    const sv = lead0.selected_vehicle as VehicleSuggestion;
+    if (sv.permalink) {
+      return { decision: "share_publication_link", replyText: `Acá tenés la publicación: ${sv.permalink}` };
+    }
+  }
+
+  // Financing-approx flow after showing a vehicle.
+  if (lead0.conversation_state === "AWAITING_FINANCE_INTEREST") {
+    const ans = normalizeYesNo(incomingText);
+    if (ans === "yes") {
+      await supabase.from("leads").update({ finance: "yes", conversation_state: "AWAITING_DOWNPAYMENT" }).eq("id", lead0.id);
+      return {
+        decision: "ask_downpayment",
+        replyText: "Dale. ¿Cuánto pensás entregar de anticipo aprox? (en $ o %)",
+      };
+    }
+    if (ans === "no") {
+      await supabase.from("leads").update({ finance: "no", conversation_state: "AWAITING_TRADE_IN" }).eq("id", lead0.id);
+      return { decision: "skip_financing", replyText: "Perfecto. ¿Tenés usado para permuta?" };
+    }
+    // If they ask a question about the unit, let extraction handle it below.
+  }
+
+  if (lead0.conversation_state === "AWAITING_DOWNPAYMENT" && lead0.selected_vehicle) {
+    const sv = lead0.selected_vehicle as any;
+    const parsed = parseDownpayment(incomingText);
+    if (!parsed.value) {
+      return { decision: "downpayment_retry", replyText: "¿Cuánto podrías entregar aprox? (por ejemplo: 30% o $5.000.000)" };
+    }
+    await supabase
+      .from("leads")
+      .update({
+        selected_vehicle: { ...sv, finance_downpayment: parsed },
+        conversation_state: "AWAITING_TERM",
+      })
+      .eq("id", lead0.id);
+    return { decision: "ask_term", replyText: "¿En cuántas cuotas te gustaría? (12/24/36/48)" };
+  }
+
+  if (lead0.conversation_state === "AWAITING_TERM" && lead0.selected_vehicle) {
+    const term = Number(String(incomingText).trim().match(/\b(12|24|36|48)\b/)?.[1] ?? NaN);
+    if (!Number.isFinite(term)) {
+      return { decision: "term_retry", replyText: "¿En cuántas cuotas? (12/24/36/48)" };
+    }
+
+    const sv = lead0.selected_vehicle as any;
+    const dp = sv.finance_downpayment as { value: number; isPercent: boolean; currency: "ARS" | "USD" } | undefined;
+    const { sell: blueSell } = await getBlueSellRate(supabase, 120);
+
+    let downARS = 0;
+    if (dp?.value) {
+      if (dp.isPercent) downARS = Math.round((sv.price_ars * dp.value) / 100);
+      else downARS = moneyToARS(dp.value, dp.currency ?? "ARS", blueSell);
+    }
+    const montoFinanciado = Math.max(0, Math.round(Number(sv.price_ars) - downARS));
+    const quote = montoFinanciado > 0 ? await getCreditCarQuote({ montoARS: montoFinanciado, modeloYear: sv.year ?? undefined }) : null;
+    const quoteLine = quote?.summaryText ? `\n\nSimulación aprox.:\n${quote.summaryText}` : "";
+
+    await supabase
+      .from("leads")
+      .update({ selected_vehicle: { ...sv, finance_term: term, finance_amount_ars: montoFinanciado }, conversation_state: "AWAITING_TRADE_IN" })
+      .eq("id", lead0.id);
+
+    return { decision: "quote_done_ask_tradein", replyText: `Listo.${quoteLine}\n\n¿Tenés usado para permuta?` };
   }
 
   // Finance fast-path when we are awaiting it
@@ -337,12 +592,18 @@ export async function runBotForIncomingMessage({
 
       await saveBotRun(supabase, lead0.id, "trade_in_set", { trade_in: t });
 
-      const agent = await pickNextAgent(supabase);
-      await supabase
-        .from("leads")
-        .update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id })
-        .eq("id", lead0.id);
+      // If the lead already has an assigned agent, avoid re-handing off. Just log/notify and keep helping.
+      if (lead0.assigned_agent_id) {
+        const { data: agent } = await supabase.from("agents").select("*").eq("id", lead0.assigned_agent_id).maybeSingle();
+        if (agent) {
+          await notifyAgentOutbox(supabase, agent, updated ?? lead0, incomingText, { trade_in: t });
+        }
+        await supabase.from("leads").update({ conversation_state: "HANDED_OFF", stage: "handed_off" }).eq("id", lead0.id);
+        return { decision: "tradein_added_already_handed_off", replyText: "Dale, lo sumo y el asesor lo tiene en cuenta. ¿Querés que te pase el link de la publicación o más fotos?" };
+      }
 
+      const agent = await pickNextAgent(supabase);
+      await supabase.from("leads").update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id }).eq("id", lead0.id);
       await notifyAgentOutbox(supabase, agent, updated ?? lead0, incomingText);
       return { decision: "handoff_ready", replyText: "Perfecto. Te derivé con un asesor para avanzar. Ya te escribe." };
     }
@@ -438,17 +699,22 @@ export async function runBotForIncomingMessage({
   }
 
   // Ready to handoff
-  const agent = await pickNextAgent(supabase);
-  await supabase
-    .from("leads")
-    .update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id })
-    .eq("id", lead0.id);
+  const alreadyAssigned = leadX.assigned_agent_id || leadX.stage === "handed_off" || leadX.conversation_state === "HANDED_OFF";
+  if (alreadyAssigned) {
+    return {
+      decision: "already_handed_off_continue",
+      replyText: "Listo. Ya hay un asesor asignado. Si querés, puedo pasarte más fotos/detalles o armarte un aproximado de cuotas.",
+      extracted,
+    };
+  }
 
+  const agent = await pickNextAgent(supabase);
+  await supabase.from("leads").update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id }).eq("id", lead0.id);
   await notifyAgentOutbox(supabase, agent, leadX, incomingText);
 
   return {
     decision: "handoff_ready",
-    replyText: "Perfecto. Te derivé con un asesor para seguir y pasarte opciones concretas. Ya te escribe.",
+    replyText: "Listo. Te derivé con un asesor para seguir y pasarte opciones concretas. Ya te escribe.",
     extracted,
   };
 }

@@ -27,9 +27,13 @@ export type VehicleSuggestion = {
   year?: number | null;
   km?: number | null;
   permalink?: string | null;
+  pictures?: string[] | null;
+  transmission?: string | null;
+  color?: string | null;
   currency_original: "ARS" | "USD";
   price_original: number;
   price_ars: number;
+  // Kept for internal comparisons only. Do not show USD conversions unless the original price is USD.
   price_usd_approx: number;
 };
 
@@ -96,6 +100,9 @@ function vehicleToSuggestion(v: VehicleRow, blueSell: number): VehicleSuggestion
     year: v.year ?? null,
     km: kmVal != null && Number.isFinite(kmVal) ? kmVal : null,
     permalink: v.permalink ?? null,
+    pictures: Array.isArray(v.pictures) ? (v.pictures as any) : null,
+    transmission: (v.transmission ?? v.Caja ?? null) as any,
+    color: (v.color ?? null) as any,
     currency_original: currencyOriginal,
     price_original: price,
     price_ars: priceARS,
@@ -229,9 +236,16 @@ export function formatVehicleOptions(suggestions: VehicleSuggestion[], meta: Sea
   const lines = suggestions.map((v, i) => {
     const year = v.year ? ` ${v.year}` : "";
     const km = v.km != null ? ` • ${Math.round(v.km).toLocaleString("es-AR")} km` : "";
-    const price = `${formatARS(v.price_ars)} (≈ ${formatUSD(v.price_usd_approx)})`;
-    const link = v.permalink ? `\n${v.permalink}` : "";
-    return `${i + 1}) ${v.title}${year}${km}\n${price}${link}`;
+
+    // Price display policy:
+    // - Show ARS always.
+    // - Only mention USD if the ORIGINAL price is USD.
+    const priceLine =
+      v.currency_original === "USD"
+        ? `${formatUSD(v.price_original)} (≈ ${formatARS(v.price_ars)})`
+        : `${formatARS(v.price_ars)}`;
+
+    return `${i + 1}) ${v.title}${year}${km}\n${priceLine}`;
   });
 
   return {
