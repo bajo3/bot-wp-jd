@@ -24,8 +24,31 @@ export type BotResult = {
 };
 
 function looksLikeGreetingOnly(t: string) {
-  const s = t.trim().toLowerCase();
-  return ["hola", "buenas", "buen día", "buen dia", "que tal", "👋"].includes(s);
+  const s = t
+    .trim()
+    .toLowerCase()
+    .replace(/[!¡?.:,;]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // Greetings even when they include a short extra phrase (e.g. "hola como estas").
+  if (/^hola\b/.test(s)) return true;
+  if (/^buen(as|os)?\b/.test(s)) return true;
+  if (/^buen\s*d[ií]a\b/.test(s) || /^buen\s*dia\b/.test(s)) return true;
+  if (/^(que|qué)\s+tal\b/.test(s)) return true;
+  if (s === "👋") return true;
+  // Keep it conservative: don't treat every message containing these words as greeting-only.
+  return false;
+}
+
+function looksLikeGreeting(t: string) {
+  const s = t
+    .trim()
+    .toLowerCase()
+    .replace(/[!¡?.:,;]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return /^hola\b/.test(s) || /^buen(as|os)?\b/.test(s) || /^(que|qué)\s+tal\b/.test(s) || s === "👋";
 }
 
 function hasAdvisorKeyword(t: string) {
@@ -47,6 +70,16 @@ function parseChoice(text: string): 1 | 2 | 3 | null {
   const m = text.trim().match(/^([1-3])\b/);
   if (!m) return null;
   return Number(m[1]) as 1 | 2 | 3;
+}
+
+function isStepAnswerForState(text: string, state: string | null | undefined) {
+  const st = String(state ?? "");
+  if (st === "AWAITING_CHOICE") return Boolean(parseChoice(text));
+  if (["AWAITING_FINANCE_INTEREST", "AWAITING_FINANCE", "AWAITING_TRADE_IN"].includes(st)) return Boolean(normalizeYesNo(text));
+  if (st === "AWAITING_TERM") return /\b(12|24|36|48)\b/.test(text);
+  if (st === "AWAITING_DOWNPAYMENT") return Boolean(parseDownpayment(text).value);
+  if (st === "AWAITING_USED_DETAILS") return text.trim().length > 0;
+  return false;
 }
 
 function looksLikeThanksOrAck(t: string) {
@@ -147,11 +180,29 @@ function parseDownpayment(text: string): { value: number | null; isPercent: bool
 
 function missingRequired(lead: LeadRow) {
   const missing: string[] = [];
-  if (!lead.intent) missing.push("intent");
-  if (!lead.budget_min && !lead.budget_max && !lead.budget_text) missing.push("budget");
-  if (!lead.car_query) missing.push("car_query");
-  if (!lead.finance) missing.push("finance");
-  if (!lead.trade_in) missing.push("trade_in");
+  if (!lead.intent) {
+    missing.push("intent");
+    return missing;
+  }
+
+  const intent = String(lead.intent).toLowerCase();
+
+  // BUY: we need budget + what they're looking for + finance + trade-in.
+  if (intent === "buy") {
+    if (!lead.budget_min && !lead.budget_max && !lead.budget_text) missing.push("budget");
+    if (!lead.car_query) missing.push("car_query");
+    if (!lead.finance) missing.push("finance");
+    if (!lead.trade_in) missing.push("trade_in");
+    return missing;
+  }
+
+  // SELL/TRADE: do NOT force the buy-flow fields. Ask for used vehicle details first.
+  // We store it as a simple text field for now.
+  if (!lead.used_vehicle_text) missing.push("used_vehicle");
+
+  // TRADE: after used details, we can ask what they want to take.
+  if (intent === "trade" && !lead.car_query) missing.push("car_query");
+
   return missing;
 }
 
@@ -203,6 +254,33 @@ async function saveOutboxToBotRuns(supabase: any, leadId: string, payload: any) 
   });
 }
 
+async function tryInsertAgentOutbox(supabase: any, leadId: string, agentId: string, payload: any) {
+  try {
+    const { error } = await supabase.from("agent_outbox").insert({
+      lead_id: leadId,
+      agent_id: agentId,
+      payload,
+      status: "pending",
+    });
+    if (error) throw error;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function tryMarkHandedOff(supabase: any, leadId: string) {
+  try {
+    await supabase
+      .from("leads")
+      .update({ handed_off_at: new Date().toISOString() })
+      .eq("id", leadId)
+      .is("handed_off_at", null);
+  } catch {
+    // ignore (column might not exist yet)
+  }
+}
+
 async function notifyAgentOutbox(
   supabase: any,
   agent: any,
@@ -238,7 +316,20 @@ async function notifyAgentOutbox(
   const leadId = lead?.id;
   if (!leadId) throw new Error("notifyAgentOutbox: lead.id missing");
 
+  // 1) Best-effort: enqueue into a dedicated outbox table (worker/n8n/edge can deliver).
+  const inserted = await tryInsertAgentOutbox(supabase, leadId, String(agent.id), payload);
+
+  // 2) Always keep a copy in bot_runs for debugging/training.
   await saveOutboxToBotRuns(supabase, leadId, payload);
+
+  // 3) Optional timestamps (if columns exist).
+  if (inserted) {
+    try {
+      await supabase.from("leads").update({ handed_off_notified_at: new Date().toISOString() }).eq("id", leadId);
+    } catch {
+      // ignore (column might not exist yet)
+    }
+  }
 }
 
 
@@ -350,13 +441,18 @@ export async function runBotForIncomingMessage({
   const isHandedOff = lead0.conversation_state === "HANDED_OFF" || lead0.stage === "handed_off";
 
   // If the last bot interaction is old, reset the flow (but keep the lead and assigned agent).
-  // This prevents the bot from continuing a stale conversation.
+  // This prevents the bot from continuing a stale conversation (e.g. still talking about a past chosen car).
   try {
     const maxAgeMin = Number(process.env.BOT_RESET_MINUTES ?? 90);
     const lastBotAt = lead0.last_bot_message_at ? new Date(String(lead0.last_bot_message_at)).getTime() : null;
     if (lastBotAt && Number.isFinite(lastBotAt)) {
       const ageMin = (Date.now() - lastBotAt) / 60000;
-      if (ageMin > maxAgeMin && looksLikeNewSearchIntent(incomingText)) {
+      const shouldResetByAge =
+        ageMin > maxAgeMin &&
+        !isStepAnswerForState(incomingText, lead0.conversation_state) &&
+        (looksLikeGreeting(incomingText) || looksLikeNewSearchIntent(incomingText) || isHandedOff);
+
+      if (shouldResetByAge) {
         await supabase
           .from("leads")
           .update({
@@ -366,6 +462,14 @@ export async function runBotForIncomingMessage({
             selected_vehicle_id: null,
           })
           .eq("id", lead0.id);
+
+        // Optional timestamp (if the column exists).
+        try {
+          await supabase.from("leads").update({ last_reset_at: new Date().toISOString() }).eq("id", lead0.id);
+        } catch {
+          // ignore
+        }
+
         lead0 = {
           ...lead0,
           conversation_state: "START",
@@ -388,6 +492,19 @@ export async function runBotForIncomingMessage({
     return { decision: "courtesy_ack", replyText: `${base}${extra}` };
   }
 
+  // When the lead is already handed off, a bare "no" should not trigger a new search/options.
+  // Example: "¿Querés link o más fotos?" -> "no".
+  if (isHandedOff) {
+    const s = incomingText.trim().toLowerCase();
+    if (s === "no" || s === "nop" || s === "nope") {
+      return {
+        decision: "handed_off_no_ack",
+        replyText:
+          "Perfecto. ¿Querés coordinar para verla, ver otra unidad, o te armo un aproximado de cuotas?",
+      };
+    }
+  }
+
   // Explicit handoff
   if (hasAdvisorKeyword(incomingText)) {
     // If already handed off, don't reassign. Just acknowledge.
@@ -402,6 +519,8 @@ export async function runBotForIncomingMessage({
       .from("leads")
       .update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id })
       .eq("id", lead0.id);
+
+    await tryMarkHandedOff(supabase, lead0.id);
 
     await notifyAgentOutbox(supabase, agent, lead0, incomingText);
     await saveBotRun(supabase, lead0.id, "handoff_keyword");
@@ -498,6 +617,55 @@ export async function runBotForIncomingMessage({
     if (sv.permalink) {
       return { decision: "share_publication_link", replyText: `Acá tenés la publicación: ${sv.permalink}` };
     }
+  }
+
+  // Used vehicle details flow (sell/trade)
+  if (lead0.conversation_state === "AWAITING_USED_DETAILS") {
+    const usedText = incomingText.trim();
+    if (usedText.length < 3) {
+      return {
+        decision: "used_details_retry",
+        replyText: "¿Me decís marca, modelo, año y km de tu usado? (ej: Suran 2013, 126.000 km)",
+      };
+    }
+
+    // Save (best-effort; column may not exist yet)
+    try {
+      await supabase.from("leads").update({ used_vehicle_text: usedText }).eq("id", lead0.id);
+    } catch {
+      // ignore
+    }
+
+    const intent = String(lead0.intent ?? "").toLowerCase();
+    if (intent === "trade") {
+      // Continue to what they want to take.
+      await supabase.from("leads").update({ conversation_state: "AWAITING_CAR" }).eq("id", lead0.id);
+      return {
+        decision: "used_details_saved_ask_car",
+        replyText: "Perfecto. ¿Qué te interesa llevar? Decime 1 o 2 modelos (ej: Fluence, Amarok).",
+      };
+    }
+
+    // SELL: handoff to an agent for valuation.
+    if (lead0.assigned_agent_id) {
+      const { data: agent } = await supabase.from("agents").select("*").eq("id", lead0.assigned_agent_id).maybeSingle();
+      if (agent) await notifyAgentOutbox(supabase, agent, lead0, incomingText, { used_vehicle_text: usedText });
+      await supabase.from("leads").update({ conversation_state: "HANDED_OFF", stage: "handed_off" }).eq("id", lead0.id);
+      await tryMarkHandedOff(supabase, lead0.id);
+      return {
+        decision: "used_details_saved_already_assigned",
+        replyText: "Dale, lo dejo asentado y el asesor lo ve para cotizarlo. Ya te escribe.",
+      };
+    }
+
+    const agent = await pickNextAgent(supabase);
+    await supabase.from("leads").update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id }).eq("id", lead0.id);
+    await tryMarkHandedOff(supabase, lead0.id);
+    await notifyAgentOutbox(supabase, agent, lead0, incomingText, { used_vehicle_text: usedText });
+    return {
+      decision: "used_details_saved_handoff",
+      replyText: "Listo. Te derivé con un asesor para cotizar tu usado. Ya te escribe.",
+    };
   }
 
   // Financing-approx flow after showing a vehicle.
@@ -599,11 +767,14 @@ export async function runBotForIncomingMessage({
           await notifyAgentOutbox(supabase, agent, updated ?? lead0, incomingText, { trade_in: t });
         }
         await supabase.from("leads").update({ conversation_state: "HANDED_OFF", stage: "handed_off" }).eq("id", lead0.id);
+        await tryMarkHandedOff(supabase, lead0.id);
         return { decision: "tradein_added_already_handed_off", replyText: "Dale, lo sumo y el asesor lo tiene en cuenta. ¿Querés que te pase el link de la publicación o más fotos?" };
       }
 
       const agent = await pickNextAgent(supabase);
       await supabase.from("leads").update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id }).eq("id", lead0.id);
+
+      await tryMarkHandedOff(supabase, lead0.id);
       await notifyAgentOutbox(supabase, agent, updated ?? lead0, incomingText);
       return { decision: "handoff_ready", replyText: "Perfecto. Te derivé con un asesor para avanzar. Ya te escribe." };
     }
@@ -674,6 +845,16 @@ export async function runBotForIncomingMessage({
   if (missing.includes("intent")) {
     return { decision: "ask_intent", replyText: "¿Buscás comprar o entregar tu usado en parte de pago?", extracted };
   }
+
+  // Sell/Trade: ask for used vehicle details before going into stock suggestions.
+  if (missing.includes("used_vehicle")) {
+    await supabase.from("leads").update({ conversation_state: "AWAITING_USED_DETAILS" }).eq("id", lead0.id);
+    return {
+      decision: "ask_used_vehicle_details",
+      replyText: "Perfecto. ¿Me decís marca, modelo, año y km de tu usado? (ej: Suran 2013, 126.000 km)",
+      extracted,
+    };
+  }
   if (missing.includes("budget")) {
     await supabase.from("leads").update({ conversation_state: "AWAITING_BUDGET" }).eq("id", lead0.id);
     return { decision: "ask_budget", replyText: "Para pasarte precios reales: ¿qué presupuesto manejás aprox? (ARS o USD)", extracted };
@@ -683,10 +864,13 @@ export async function runBotForIncomingMessage({
     return { decision: "ask_car", replyText: "¿Qué modelo/segmento buscás? (decime 1 o 2 modelos)", extracted };
   }
 
-  // We have enough to show options even if they didn't explicitly ask for catalog
+  // Auto-show options ONLY when we're at the start of a search flow.
   if (!missing.includes("budget") && !missing.includes("car_query")) {
-    const shown = await showOptionsAndStore(supabase, lead0.id, leadX);
-    return { decision: "show_options_auto", replyText: shown.replyText, extracted };
+    const st = String(leadX.conversation_state ?? "START");
+    if (["START", "AWAITING_BUDGET", "AWAITING_CAR"].includes(st)) {
+      const shown = await showOptionsAndStore(supabase, lead0.id, leadX);
+      return { decision: "show_options_auto", replyText: shown.replyText, extracted };
+    }
   }
 
   if (missing.includes("finance")) {
@@ -710,6 +894,7 @@ export async function runBotForIncomingMessage({
 
   const agent = await pickNextAgent(supabase);
   await supabase.from("leads").update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id }).eq("id", lead0.id);
+  await tryMarkHandedOff(supabase, lead0.id);
   await notifyAgentOutbox(supabase, agent, leadX, incomingText);
 
   return {

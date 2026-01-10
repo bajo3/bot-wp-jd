@@ -2,6 +2,7 @@ export type ConversationState =
   | "START"
   | "AWAITING_BUDGET"
   | "AWAITING_CAR"
+  | "AWAITING_USED_DETAILS"
   | "AWAITING_CHOICE"
   | "POST_CHOICE"
   | "AWAITING_FINANCE_INTEREST"

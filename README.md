@@ -16,6 +16,8 @@ Ejecutá en orden:
  - `sql/003_exchange_rates.sql` (cache Dólar Blue)
  - `sql/004_followups.sql` (seguimiento automático)
  - `sql/005_leads_vehicle_context.sql` (memoria de sugerencias / selección)
+ - `sql/006_leads_handoff_and_used.sql` (reset por inactividad + usados)
+ - `sql/007_agent_outbox.sql` (outbox para notificar vendedores)
 
 > Importante: el bot usa tu tabla real `public.vehicles` (según el dump que me pasaste) con columnas:
 > `id, title, brand, model, year, price, currency, pictures, permalink, km/Km, status`.
@@ -37,7 +39,7 @@ El bot soporta presupuestos en ARS o USD y normaliza todo a ARS usando **Dólar 
 ## 4) Derivación (round-robin)
 Cuando el bot decide derivar:
 - asigna el lead a un agente (tabla `agents`)
-- guarda el resumen en `bot_runs` (decision `notify_agent_outbox`)
+- encola el resumen en `agent_outbox` (status `pending`) y también guarda una copia en `bot_runs` (decision `notify_agent_outbox`)
 
 El vendedor, por ahora, le escribe al cliente desde su WhatsApp personal usando el link `wa.me`.
 
