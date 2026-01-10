@@ -6,6 +6,38 @@ import { runBotForIncomingMessage } from "@/lib/bot/runBot";
 
 export const runtime = "nodejs";
 
+async function scheduleInitialFollowups(supabase: any, leadId: string) {
+  // Creates 3 pending follow-ups (+2d, +7d, +15d).
+  // If the table isn't deployed yet, we just skip silently.
+  const now = Date.now();
+  const steps = [
+    { step: 1, runAt: new Date(now + 2 * 24 * 60 * 60 * 1000) },
+    { step: 2, runAt: new Date(now + 7 * 24 * 60 * 60 * 1000) },
+    { step: 3, runAt: new Date(now + 15 * 24 * 60 * 60 * 1000) },
+  ];
+
+  try {
+    await supabase.from("followups").insert(
+      steps.map((s) => ({
+        lead_id: leadId,
+        step: s.step,
+        run_at: s.runAt.toISOString(),
+        status: "pending",
+      }))
+    );
+  } catch {
+    // ignore (table might not exist yet)
+  }
+}
+
+async function cancelPendingFollowups(supabase: any, leadId: string) {
+  try {
+    await supabase.from("followups").update({ status: "canceled" }).eq("lead_id", leadId).eq("status", "pending");
+  } catch {
+    // ignore
+  }
+}
+
 function verifySignature(rawBody: string, signatureHeader: string | null) {
   // Header: "sha256=..."
   const appSecret = process.env.META_APP_SECRET;
@@ -64,6 +96,14 @@ export async function POST(req: Request) {
 
   const supabase = createAdminClient();
 
+  // Detect if this lead is new (for followups scheduling).
+  const { data: existingLead } = await supabase
+    .from("leads")
+    .select("id, stage")
+    .eq("phone_e164", phoneE164)
+    .maybeSingle();
+  const isNewLead = !existingLead;
+
   // idempotencia
   if (waMessageId) {
     const { data: existing } = await supabase
@@ -91,6 +131,17 @@ export async function POST(req: Request) {
 
   if (leadErr || !lead) {
     return NextResponse.json({ error: "Lead upsert failed" }, { status: 500 });
+  }
+
+  // If this isn't the first message, treat it as a "response" and cancel pending followups.
+  // Also mark as contacted unless already handed off.
+  if (!isNewLead) {
+    await cancelPendingFollowups(supabase, lead.id);
+    if (lead.stage && lead.stage !== "handed_off") {
+      await supabase.from("leads").update({ stage: "contacted" }).eq("id", lead.id);
+    }
+  } else {
+    await scheduleInitialFollowups(supabase, lead.id);
   }
 
   // guardar mensaje entrante

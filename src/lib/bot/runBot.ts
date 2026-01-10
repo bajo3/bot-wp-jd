@@ -1,12 +1,17 @@
 /*
-  Bot core:
-  - Extrae datos con OpenAI (JSON)
-  - Decide el próximo paso (preguntar 1 cosa, mostrar catálogo, o derivar)
-  - Round-robin entre agentes
+  Bot core (improved):
 
-  Nota: notificar al vendedor por WhatsApp desde Cloud API puede requerir ventana 24h o templates.
-  Por eso dejamos un "outbox" dentro de bot_runs para que lo consumas como quieras.
+  Goals implemented:
+  - One question per message (no "se queda" con 2 preguntas juntas)
+  - Vehicles search is "budget aware" (ARS/USD) using Dólar Blue SELL (venta)
+  - Always returns the 3 closest vehicles by price (even if outside budget)
+  - Supports numeric selection (1/2/3) with stored suggestions
+  - Integrates CreditCar quote when financing
+  - Keeps handoff-outbox in bot_runs (provider-agnostic)
 */
+
+import { searchVehiclesClosest, formatVehicleOptions, type VehicleSuggestion } from "@/lib/vehicleSearch";
+import { getCreditCarQuote } from "@/lib/creditcar";
 
 type LeadRow = any;
 
@@ -22,7 +27,24 @@ function looksLikeGreetingOnly(t: string) {
 }
 
 function hasAdvisorKeyword(t: string) {
-  return t.toLowerCase().includes("hablar con asesor");
+  const s = t.toLowerCase();
+  return s.includes("hablar con asesor") || s.includes("asesor") || s.includes("vendedor") || s.includes("humano");
+}
+
+function normalizeYesNo(text: string): "yes" | "no" | "maybe" | null {
+  const s = text.toLowerCase();
+  if (/(contado|efectivo|de contado|transferencia|cash)/.test(s)) return "no";
+  if (/(finan|cr[eé]dito|cuota|cuotas|plan|pr[eé]stamo)/.test(s)) return "yes";
+  if (/(capaz|puede ser|tal vez|no se|depende)/.test(s)) return "maybe";
+  if (/\b(si|sí|sisi|sii)\b/.test(s)) return "yes";
+  if (/\b(no|nop)\b/.test(s)) return "no";
+  return null;
+}
+
+function parseChoice(text: string): 1 | 2 | 3 | null {
+  const m = text.trim().match(/^([1-3])\b/);
+  if (!m) return null;
+  return Number(m[1]) as 1 | 2 | 3;
 }
 
 function missingRequired(lead: LeadRow) {
@@ -54,11 +76,7 @@ async function pickNextAgent(supabase: any) {
     .single();
 
   const lastId = (cursor?.last_agent_id as string | null) ?? null;
-  const idx = Math.max(
-    0,
-    agents.findIndex((a: any) => a.id === lastId)
-  );
-
+  const idx = Math.max(0, agents.findIndex((a: any) => a.id === lastId));
   const next = agents[(idx + 1) % agents.length];
 
   await supabase
@@ -69,64 +87,64 @@ async function pickNextAgent(supabase: any) {
   return next as { id: string; name: string; phone_e164: string };
 }
 
-async function searchVehicles(supabase: any, lead: LeadRow) {
-  /*
-    Adaptado a tu tabla real (public.vehicles) según el dump que pasaste:
-      - title, brand, model, year, price, currency
-      - pictures (text[])
-      - permalink
-      - km (lowercase) y también existe "Km" (legacy). Usamos el que esté.
-      - status: usamos ('available','active') como visibles
-
-    Si más adelante querés filtrar por agency/tenant:
-      - seteá DEALERSHIP_ID en .env y se filtra por dealership_id.
-  */
-
-  let q = supabase
-    .from("vehicles")
-    .select(
-      "id, title, brand, model, year, price, currency, pictures, permalink, km, Km, transmission, Caja, color, status, dealership_id"
-    )
-    .in("status", ["available", "active"]);
-
-  const dealershipId = process.env.DEALERSHIP_ID;
-  if (dealershipId) q = q.eq("dealership_id", dealershipId);
-
-  const budget = lead.budget_max ?? lead.budget_min;
-  if (budget) q = q.lte("price", budget);
-
-  if (lead.car_query) {
-    const s = String(lead.car_query).replace(/'/g, "").trim();
-    if (s) {
-      // Busca por marca/modelo y también por título (suele contener versión)
-      q = q.or(`brand.ilike.%${s}%,model.ilike.%${s}%,title.ilike.%${s}%`);
-    }
-  }
-
-  const { data, error } = await q.order("price", { ascending: true }).limit(3);
-  if (error) throw error;
-  return data ?? [];
+async function saveBotRun(supabase: any, leadId: string, decision: string, extracted?: any) {
+  await supabase.from("bot_runs").insert({
+    lead_id: leadId,
+    decision,
+    extracted: extracted ?? null,
+    model_used: process.env.OPENAI_MODEL ?? null,
+  });
 }
 
-function formatCars(cars: any[]) {
-  if (!cars.length) {
-    return "No encontré opciones con esos filtros. ¿Querés decirme 2 modelos que te gusten o subir un poco el presupuesto?";
-  }
-
-  return cars
-    .map((c) => {
-      const title = (c.title ?? `${c.brand ?? ""} ${c.model ?? ""}`.trim()).trim();
-      const year = c.year ? ` ${c.year}` : "";
-      const kmVal = c.km ?? c.Km;
-      const km = kmVal ? `${kmVal} km` : "";
-      const currency = c.currency ?? "ARS";
-      const price = c.price != null ? `${currency} ${Number(c.price).toLocaleString("es-AR")}` : "";
-      const link = c.permalink ? `\n${c.permalink}` : "";
-
-      return `• ${title}${year} — ${price}\n${km}${link}`.trim();
-    })
-    .join("\n\n");
+async function saveOutboxToBotRuns(supabase: any, leadId: string, payload: any) {
+  await supabase.from("bot_runs").insert({
+    lead_id: leadId,
+    decision: "notify_agent_outbox",
+    extracted: payload,
+    model_used: process.env.OPENAI_MODEL ?? null,
+  });
 }
+
+async function notifyAgentOutbox(
+  supabase: any,
+  agent: any,
+  lead: any,
+  lastUserText: string,
+  extra?: any
+) {
+  const payload = {
+    agentPhoneE164: agent.phone_e164,
+    summary: {
+      phone: lead.phone_e164,
+      name: lead.name,
+      intent: lead.intent,
+      budget_min: lead.budget_min,
+      budget_max: lead.budget_max,
+      budget_text: lead.budget_text,
+      budget_currency: lead.budget_currency,
+      car_query: lead.car_query,
+      finance: lead.finance,
+      trade_in: lead.trade_in,
+      urgency: lead.urgency,
+      lead_quality: lead.lead_quality,
+      selected_vehicle: lead.selected_vehicle ?? null,
+      lastUserText,
+      ...extra,
+    },
+    action: {
+      type: "agent_should_contact_client_from_own_whatsapp",
+      wa_me_link: `https://wa.me/${String(lead.phone_e164).replace("+", "")}`,
+    },
+  };
+
+  const leadId = lead?.id;
+  if (!leadId) throw new Error("notifyAgentOutbox: lead.id missing");
+
+  await saveOutboxToBotRuns(supabase, leadId, payload);
+}
+
+
+
 
 async function extractWithLLM(incomingText: string, lead: LeadRow) {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -136,15 +154,19 @@ async function extractWithLLM(incomingText: string, lead: LeadRow) {
   const system = `
 Sos un extractor de datos de leads de una agencia de autos.
 Devolvé SOLO JSON válido con estas claves:
-intent, budget_min, budget_max, budget_text, car_query, finance, trade_in, urgency, lead_quality, wants_catalog
+
+intent, budget_min, budget_max, budget_text, budget_currency, car_query, finance, trade_in, urgency, lead_quality, wants_catalog
 
 Reglas:
 - No inventes.
-- budget_* numérico en pesos si se puede; si no, budget_text.
+- intent: "buy" | "sell" | "trade" | null
+- budget_*: numérico SIEMPRE (sin símbolos) en la moneda indicada por budget_currency.
+- budget_currency: "ARS" | "USD" | null. Si el usuario menciona dólares/usd/u$s => USD.
+- Si no se puede parsear un número, usar budget_text.
 - finance y trade_in: "yes"|"no"|"maybe"|null
 - urgency: "low"|"medium"|"high"|null
 - lead_quality: "low"|"medium"|"high"|null
-- wants_catalog true si pide ver autos/opciones/catálogo/modelos.
+- wants_catalog true si pide ver autos/opciones/catálogo/modelos o si pregunta "qué tenés".
 `;
 
   const user = `
@@ -154,6 +176,7 @@ Lead actual (puede estar incompleto): ${JSON.stringify({
     budget_min: lead.budget_min,
     budget_max: lead.budget_max,
     budget_text: lead.budget_text,
+    budget_currency: lead.budget_currency,
     car_query: lead.car_query,
     finance: lead.finance,
     trade_in: lead.trade_in,
@@ -181,39 +204,30 @@ Lead actual (puede estar incompleto): ${JSON.stringify({
   return JSON.parse(content);
 }
 
-async function saveOutboxToBotRuns(supabase: any, leadId: string, payload: any, modelUsed?: string) {
-  await supabase.from("bot_runs").insert({
-    lead_id: leadId,
-    decision: "notify_agent_outbox",
-    extracted: payload,
-    model_used: modelUsed ?? null,
-  });
+async function showOptionsAndStore(supabase: any, leadId: string, lead: any) {
+  const result = await searchVehiclesClosest({ supabase, lead, limit: 3 });
+  const { text, suggestions } = formatVehicleOptions(result.suggestions, result.meta);
+
+  await supabase
+    .from("leads")
+    .update({
+      last_vehicle_suggestions: suggestions,
+      selected_vehicle: null,
+      selected_vehicle_id: null,
+      conversation_state: "AWAITING_CHOICE",
+    })
+    .eq("id", leadId);
+
+  return {
+    replyText: `${text}
+
+¿Cuál te interesa? Respondé 1, 2 o 3.`, suggestions
+  };
 }
 
-async function notifyAgentOutbox(supabase: any, agent: any, lead: any, lastUserText: string) {
-  const payload = {
-    agentPhoneE164: agent.phone_e164,
-    summary: {
-      phone: lead.phone_e164,
-      name: lead.name,
-      intent: lead.intent,
-      budget_min: lead.budget_min,
-      budget_max: lead.budget_max,
-      budget_text: lead.budget_text,
-      car_query: lead.car_query,
-      finance: lead.finance,
-      trade_in: lead.trade_in,
-      urgency: lead.urgency,
-      lead_quality: lead.lead_quality,
-      lastUserText,
-    },
-    action: {
-      type: "agent_should_contact_client_from_own_whatsapp",
-      wa_me_link: `https://wa.me/${String(lead.phone_e164).replace("+", "")}`,
-    },
-  };
-
-  await saveOutboxToBotRuns(supabase, lead.id, payload, process.env.OPENAI_MODEL  || undefined);
+function getSuggestionByChoice(suggestions: VehicleSuggestion[] | null | undefined, choice: 1 | 2 | 3) {
+  if (!Array.isArray(suggestions)) return null;
+  return suggestions[choice - 1] ?? null;
 }
 
 export async function runBotForIncomingMessage({
@@ -225,6 +239,16 @@ export async function runBotForIncomingMessage({
   lead: LeadRow;
   incomingText: string;
 }): Promise<BotResult | null> {
+  // Refresh lead (we rely on stored suggestions/state)
+  const { data: fresh } = await supabase.from("leads").select("*").eq("id", lead.id).single();
+  const lead0 = fresh ?? lead;
+
+  // If already handed off, keep it short
+  if (lead0.conversation_state === "HANDED_OFF") {
+    return { decision: "already_handed_off", replyText: "Perfecto, ya te contacta un asesor." };
+  }
+
+  // Explicit handoff
   if (hasAdvisorKeyword(incomingText)) {
     const agent = await pickNextAgent(supabase);
     await supabase
@@ -234,31 +258,114 @@ export async function runBotForIncomingMessage({
         conversation_state: "HANDED_OFF",
         assigned_agent_id: agent.id,
       })
-      .eq("id", lead.id);
+      .eq("id", lead0.id);
 
-    await notifyAgentOutbox(supabase, agent, lead, incomingText);
+    await notifyAgentOutbox(supabase, agent, lead0, incomingText);
+    await saveBotRun(supabase, lead0.id, "handoff_keyword");
 
-    return {
-      decision: "handoff_keyword",
-      replyText: "Perfecto. Te derivé con un asesor, ya te escribe.",
-    };
+    return { decision: "handoff_keyword", replyText: "Perfecto. Te derivé con un asesor, ya te escribe." };
+  }
+
+  // Choice fast-path: "1" / "2" / "3"
+  const choice = parseChoice(incomingText);
+  if (choice && lead0.last_vehicle_suggestions) {
+    const suggestions = lead0.last_vehicle_suggestions as VehicleSuggestion[];
+    const picked = getSuggestionByChoice(suggestions, choice);
+    if (picked) {
+      // Save selection
+      await supabase
+        .from("leads")
+        .update({
+          selected_vehicle_id: picked.id,
+          selected_vehicle: picked,
+          conversation_state: "AWAITING_FINANCE",
+        })
+        .eq("id", lead0.id);
+
+      await saveBotRun(supabase, lead0.id, "vehicle_selected", { choice, picked });
+
+      // If finance already known, skip straight to next missing
+      if (!lead0.finance) {
+        return { decision: "ask_finance_after_choice", replyText: "Perfecto. ¿Lo querés financiar o sería contado?" };
+      }
+
+      if (!lead0.trade_in) {
+        return { decision: "ask_tradein_after_choice", replyText: "¿Tenés usado para permuta?" };
+      }
+
+      // Ready to handoff
+      const agent = await pickNextAgent(supabase);
+      await supabase
+        .from("leads")
+        .update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id })
+        .eq("id", lead0.id);
+
+      await notifyAgentOutbox(supabase, agent, { ...lead0, selected_vehicle: picked }, incomingText);
+      return { decision: "handoff_after_choice", replyText: "Listo. Te paso con un asesor para coordinar." };
+    }
+  }
+
+  // Finance fast-path when we are awaiting it
+  if (lead0.conversation_state === "AWAITING_FINANCE") {
+    const f = normalizeYesNo(incomingText);
+    if (f) {
+      await supabase.from("leads").update({ finance: f, conversation_state: "AWAITING_TRADE_IN" }).eq("id", lead0.id);
+      await saveBotRun(supabase, lead0.id, "finance_set", { finance: f });
+
+      if (f === "yes" && lead0.selected_vehicle) {
+        const sv = lead0.selected_vehicle as VehicleSuggestion;
+        const quote = await getCreditCarQuote({ montoARS: sv.price_ars, modeloYear: sv.year ?? undefined });
+        // Ask next question only
+        const quoteLine = quote?.summaryText ? `\n\nSimulación aprox.: ${quote.summaryText}` : "";
+        return { decision: "ask_tradein_with_quote", replyText: `Perfecto.${quoteLine}\n\n¿Tenés usado para permuta?` };
+      }
+
+      return { decision: "ask_tradein", replyText: "¿Tenés usado para permuta?" };
+    }
+  }
+
+  // Trade-in fast-path when we are awaiting it
+  if (lead0.conversation_state === "AWAITING_TRADE_IN") {
+    const t = normalizeYesNo(incomingText);
+    if (t) {
+      const { data: updated } = await supabase
+        .from("leads")
+        .update({ trade_in: t })
+        .eq("id", lead0.id)
+        .select("*")
+        .single();
+
+      await saveBotRun(supabase, lead0.id, "trade_in_set", { trade_in: t });
+
+      const agent = await pickNextAgent(supabase);
+      await supabase
+        .from("leads")
+        .update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id })
+        .eq("id", lead0.id);
+
+      await notifyAgentOutbox(supabase, agent, updated ?? lead0, incomingText);
+      return { decision: "handoff_ready", replyText: "Perfecto. Te derivé con un asesor para avanzar. Ya te escribe." };
+    }
   }
 
   if (looksLikeGreetingOnly(incomingText)) {
     return {
       decision: "greeting",
-      replyText: "¡Hola! Soy el asistente de Jesús Díaz Automotores 😊 ¿Buscás comprar o entregar tu usado en parte de pago?",
+      replyText: "¡Hola! Soy el asistente de Jesús Díaz Automotores. ¿Buscás comprar o entregar tu usado en parte de pago?",
     };
   }
 
-  const extracted = await extractWithLLM(incomingText, lead);
+  // LLM extraction for slot filling
+  const extracted = await extractWithLLM(incomingText, lead0);
 
+  // Apply patch
   const patch: any = {};
   const keys = [
     "intent",
     "budget_min",
     "budget_max",
     "budget_text",
+    "budget_currency",
     "car_query",
     "finance",
     "trade_in",
@@ -276,100 +383,68 @@ export async function runBotForIncomingMessage({
       .from("leads")
       .update({
         ...patch,
-        stage: lead.stage === "new" ? "qualifying" : lead.stage,
+        stage: lead0.stage === "new" ? "qualifying" : lead0.stage,
       })
-      .eq("id", lead.id);
+      .eq("id", lead0.id);
   }
 
-  const { data: fresh } = await supabase.from("leads").select("*").eq("id", lead.id).single();
-  const lead2 = fresh ?? lead;
+  await saveBotRun(supabase, lead0.id, "extracted", extracted);
 
-  const missing = missingRequired(lead2);
+  const { data: lead2 } = await supabase.from("leads").select("*").eq("id", lead0.id).single();
+  const leadX = lead2 ?? lead0;
+  const missing = missingRequired(leadX);
 
-  const highIntent = lead2.lead_quality === "high" || lead2.urgency === "high";
-  if (highIntent && missing.length <= 2) {
-    const agent = await pickNextAgent(supabase);
-    await supabase
-      .from("leads")
-      .update({
-        stage: "handed_off",
-        conversation_state: "HANDED_OFF",
-        assigned_agent_id: agent.id,
-      })
-      .eq("id", lead.id);
-
-    await notifyAgentOutbox(supabase, agent, lead2, incomingText);
-
-    return {
-      decision: "handoff_high_intent",
-      replyText: "Genial. Te derivé con un asesor para avanzar y pasarte opciones concretas. Ya te escribe.",
-      extracted,
-    };
-  }
-
+  // If user wants catalog/options, show options but ask ONLY for choice.
   if (extracted?.wants_catalog) {
     if (missing.includes("budget")) {
-      return { decision: "ask_budget_for_catalog", replyText: "Dale. ¿Qué presupuesto manejás aprox. (en pesos)?", extracted };
+      await supabase.from("leads").update({ conversation_state: "AWAITING_BUDGET" }).eq("id", lead0.id);
+      return { decision: "ask_budget_for_catalog", replyText: "Dale. ¿Qué presupuesto manejás aprox? (podés decir ARS o USD)", extracted };
     }
     if (missing.includes("car_query")) {
-      return { decision: "ask_car_for_catalog", replyText: "Perfecto. ¿Qué buscás: algún modelo en particular o preferís sedan / suv / pickup?", extracted };
+      await supabase.from("leads").update({ conversation_state: "AWAITING_CAR" }).eq("id", lead0.id);
+      return { decision: "ask_car_for_catalog", replyText: "Perfecto. ¿Qué buscás? Decime 1 o 2 modelos que te gusten.", extracted };
     }
 
-    const cars = await searchVehicles(supabase, lead2);
-    const list = formatCars(cars);
-
-    if (missing.includes("finance")) {
-      return { decision: "show_cars_then_finance", replyText: `${list}
-
-¿Lo querés financiar o sería contado?`, extracted };
-    }
-    if (missing.includes("trade_in")) {
-      return { decision: "show_cars_then_tradein", replyText: `${list}
-
-¿Tenés usado para permuta?`, extracted };
-    }
-
-    return {
-      decision: "show_cars",
-      replyText: `${list}
-
-¿Querés que te derive con un asesor para coordinar y pasarte más opciones? (si querés escribí: HABLAR CON ASESOR)`,
-      extracted,
-    };
+    const shown = await showOptionsAndStore(supabase, lead0.id, leadX);
+    return { decision: "show_options", replyText: shown.replyText, extracted };
   }
 
-  if (missing.includes("budget")) {
-    return {
-      decision: "ask_budget",
-      replyText: "Para pasarte precios reales: ¿qué presupuesto manejás aprox. (en pesos)?",
-      extracted,
-    };
-  }
-
+  // Ask missing one-by-one (single question)
   if (missing.includes("intent")) {
     return { decision: "ask_intent", replyText: "¿Buscás comprar o entregar tu usado en parte de pago?", extracted };
   }
-  if (missing.includes("car_query")) {
-    return { decision: "ask_car", replyText: "¿Qué modelo/segmento buscás? (ej: Cruze, Corolla, SUV, pickup)", extracted };
+  if (missing.includes("budget")) {
+    await supabase.from("leads").update({ conversation_state: "AWAITING_BUDGET" }).eq("id", lead0.id);
+    return { decision: "ask_budget", replyText: "Para pasarte precios reales: ¿qué presupuesto manejás aprox? (ARS o USD)", extracted };
   }
+  if (missing.includes("car_query")) {
+    await supabase.from("leads").update({ conversation_state: "AWAITING_CAR" }).eq("id", lead0.id);
+    return { decision: "ask_car", replyText: "¿Qué modelo/segmento buscás? (decime 1 o 2 modelos)", extracted };
+  }
+
+  // We have enough to show options even if they didn't explicitly ask for catalog
+  if (!missing.includes("budget") && !missing.includes("car_query")) {
+    const shown = await showOptionsAndStore(supabase, lead0.id, leadX);
+    return { decision: "show_options_auto", replyText: shown.replyText, extracted };
+  }
+
   if (missing.includes("finance")) {
+    await supabase.from("leads").update({ conversation_state: "AWAITING_FINANCE" }).eq("id", lead0.id);
     return { decision: "ask_finance", replyText: "¿Lo querés financiar o sería contado?", extracted };
   }
   if (missing.includes("trade_in")) {
+    await supabase.from("leads").update({ conversation_state: "AWAITING_TRADE_IN" }).eq("id", lead0.id);
     return { decision: "ask_tradein", replyText: "¿Tenés usado para permuta?", extracted };
   }
 
+  // Ready to handoff
   const agent = await pickNextAgent(supabase);
   await supabase
     .from("leads")
-    .update({
-      stage: "handed_off",
-      conversation_state: "HANDED_OFF",
-      assigned_agent_id: agent.id,
-    })
-    .eq("id", lead.id);
+    .update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id })
+    .eq("id", lead0.id);
 
-  await notifyAgentOutbox(supabase, agent, lead2, incomingText);
+  await notifyAgentOutbox(supabase, agent, leadX, incomingText);
 
   return {
     decision: "handoff_ready",

@@ -13,6 +13,9 @@ npm run dev
 Ejecutá en orden:
 - `sql/001_init.sql`
 - `sql/002_seed_agents.sql`
+ - `sql/003_exchange_rates.sql` (cache Dólar Blue)
+ - `sql/004_followups.sql` (seguimiento automático)
+ - `sql/005_leads_vehicle_context.sql` (memoria de sugerencias / selección)
 
 > Importante: el bot usa tu tabla real `public.vehicles` (según el dump que me pasaste) con columnas:
 > `id, title, brand, model, year, price, currency, pictures, permalink, km/Km, status`.
@@ -25,14 +28,18 @@ Ejecutá en orden:
 - Usá `META_VERIFY_TOKEN` para la verificación.
 - (Recomendado) completá `META_APP_SECRET` para validar `X-Hub-Signature-256`.
 
+## 3.1) Precios ARS/USD (Dólar Blue)
+El bot soporta presupuestos en ARS o USD y normaliza todo a ARS usando **Dólar Blue (venta)**.
+
+- Cachea la cotización en `public.exchange_rates` por 120 minutos (configurable con `DOLAR_CACHE_MINUTES`).
+- Para conversiones usa **redondeo hacia arriba**.
+
 ## 4) Derivación (round-robin)
 Cuando el bot decide derivar:
 - asigna el lead a un agente (tabla `agents`)
 - guarda el resumen en `bot_runs` (decision `notify_agent_outbox`)
 
 El vendedor, por ahora, le escribe al cliente desde su WhatsApp personal usando el link `wa.me`.
-
----
 
 Si querés que el bot *también* le mande el resumen al vendedor por WhatsApp, vas a necesitar:
 - que el vendedor haya dado opt-in al número del bot, y
