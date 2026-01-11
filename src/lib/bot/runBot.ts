@@ -718,14 +718,25 @@ export async function runBotForIncomingMessage({
     }
     const montoFinanciado = Math.max(0, Math.round(Number(sv.price_ars) - downARS));
     const quote = montoFinanciado > 0 ? await getCreditCarQuote({ montoARS: montoFinanciado, modeloYear: sv.year ?? undefined, term }) : null;
-    const quoteLine = quote?.summaryText ? `\n\nSimulación aprox.:\n${quote.summaryText}` : "";
+    const cuotaCreditCar = quote?.selected?.cuota ?? null;
+    const cuotaLine = cuotaCreditCar
+      ? `
+
+Cuotas (CreditCar):
+- ${term} cuotas: $ ${Math.round(cuotaCreditCar).toLocaleString("es-AR")}`
+      : (quote?.summaryText ? `
+
+Simulación aprox.:
+${quote.summaryText}` : "");
 
     await supabase
       .from("leads")
       .update({ selected_vehicle: { ...sv, finance_term: term, finance_amount_ars: montoFinanciado }, conversation_state: "AWAITING_TRADE_IN" })
       .eq("id", lead0.id);
 
-    return { decision: "quote_done_ask_tradein", replyText: `Listo.${quoteLine}\n\n¿Tenés usado para permuta?` };
+    return { decision: "quote_done_ask_tradein", replyText: `Listo.${cuotaLine}
+
+¿Tenés usado para permuta?` };
   }
 
   // Finance fast-path when we are awaiting it
@@ -737,9 +748,20 @@ export async function runBotForIncomingMessage({
 
       if (f === "yes" && lead0.selected_vehicle) {
         const sv = lead0.selected_vehicle as VehicleSuggestion;
-        const quote = await getCreditCarQuote({ montoARS: sv.price_ars, modeloYear: sv.year ?? undefined });
+        const quote = await getCreditCarQuote({
+          montoARS: (sv as any).finance_amount_ars ?? (sv as any).price_ars,
+          modeloYear: (sv as any).year ?? undefined,
+          term: (sv as any).finance_term ?? undefined,
+        });
         // Ask next question only
-        const quoteLine = quote?.summaryText ? `\n\nSimulación aprox.: ${quote.summaryText}` : "";
+        const cuotaCreditCar = quote?.selected?.cuota ?? null;
+        const quoteLine = cuotaCreditCar
+          ? `
+
+Cuotas (CreditCar): $ ${Math.round(cuotaCreditCar).toLocaleString("es-AR")}`
+          : (quote?.summaryText ? `
+
+Simulación aprox.: ${quote.summaryText}` : "");
         return { decision: "ask_tradein_with_quote", replyText: `Perfecto.${quoteLine}\n\n¿Tenés usado para permuta?` };
       }
 

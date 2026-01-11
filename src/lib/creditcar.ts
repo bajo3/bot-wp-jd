@@ -10,7 +10,30 @@
 export type CreditCarQuote = {
   raw: any;
   summaryText: string;
+  selected?: { plazo: number; cuota: number; inclusion?: any };
 };
+
+function parseNumberLoose(v: any): number | null {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  const s = String(v).replace(/\./g, "").replace(/,/g, ".").trim(); // handles 521400.00 or 521.400,00
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+function selectOption(raw: any, term?: number): { plazo: number; cuota: number; inclusion?: any } | null {
+  if (!term || !Array.isArray(raw)) return null;
+  const candidates = raw
+    .map((o: any) => {
+      const plazo = parseNumberLoose(o?.plazo ?? o?.meses ?? o?.cantidad_cuotas ?? o?.cuotas);
+      const cuota = parseNumberLoose(o?.cuota ?? o?.cuota_mensual ?? o?.cuotaMensual ?? o?.valor_cuota);
+      if (!plazo || !cuota) return null;
+      return { plazo: Math.round(plazo), cuota, inclusion: o?.inclusion ?? null };
+    })
+    .filter(Boolean) as Array<{ plazo: number; cuota: number; inclusion?: any }>;
+  const exact = candidates.find((c) => c.plazo === term);
+  return exact ?? null;
+}
 
 function pickNumbers(obj: any): number[] {
   const nums: number[] = [];
@@ -160,9 +183,15 @@ export async function getCreditCarQuote(params: { montoARS: number; modeloYear?:
       }
     }
 
+    const selected = selectOption(raw, term);
+    const summaryText = selected
+      ? `• ${selected.plazo} cuotas — cuota aprox. ${Math.round(selected.cuota).toLocaleString("es-AR")}`
+      : summarize(raw);
+
     return {
       raw,
-      summaryText: summarize(raw),
+      summaryText,
+      selected: selected ?? undefined,
     };
   } catch (e: any) {
     const msg = e?.name === "AbortError" ? "timeout" : String(e?.message || e);
