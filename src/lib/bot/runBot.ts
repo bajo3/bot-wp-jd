@@ -10,63 +10,17 @@
   - Keeps handoff-outbox in bot_runs (provider-agnostic)
 */
 
-import {
-  searchVehiclesClosest,
-  fetchSuggestionsByIds,
-  formatVehicleOptions,
-  type VehicleSuggestion,
-} from "@/lib/vehicleSearch";
+import { searchVehiclesClosest, formatVehicleOptions, type VehicleSuggestion } from "@/lib/vehicleSearch";
 import { getCreditCarQuote } from "@/lib/creditcar";
 import { getBlueSellRate, moneyToARS } from "@/lib/exchangeRate";
 
 type LeadRow = any;
 
-type SuggestionStoreV1 = {
-  v: 1;
-  page: number;
-  pages: string[][]; // arrays of vehicle ids per page
-  current: VehicleSuggestion[];
-};
-
-function toSuggestionStore(raw: any): SuggestionStoreV1 {
-  // Legacy: raw is an array of suggestions.
-  if (Array.isArray(raw)) {
-    const ids = raw.map((x: any) => String(x?.id)).filter(Boolean);
-    return { v: 1, page: 0, pages: ids.length ? [ids] : [], current: raw as any };
-  }
-
-  // New: object store
-  if (raw && typeof raw === "object" && raw.v === 1 && Array.isArray(raw.pages) && Array.isArray(raw.current)) {
-    const page = Number(raw.page ?? 0);
-    const pages = raw.pages.map((p: any) => (Array.isArray(p) ? p.map(String).filter(Boolean) : [])).filter(Boolean);
-    return {
-      v: 1,
-      page: Number.isFinite(page) ? Math.max(0, Math.min(page, Math.max(0, pages.length - 1))) : 0,
-      pages,
-      current: raw.current as any,
-    };
-  }
-
-  return { v: 1, page: 0, pages: [], current: [] };
-}
-
-function flattenPages(pages: string[][]): string[] {
-  const out: string[] = [];
-  for (const p of pages) for (const id of p) out.push(String(id));
-  // unique while preserving order
-  const seen = new Set<string>();
-  const uniq: string[] = [];
-  for (const id of out) {
-    if (seen.has(id)) continue;
-    seen.add(id);
-    uniq.push(id);
-  }
-  return uniq;
-}
-
 export type BotResult = {
   replyText?: string;
   outgoing?: Array<{ type: "text"; body: string } | { type: "image"; link: string; caption?: string }>; 
+  /** Optional extra notifications (e.g. send a summary to an internal/test number). */
+  notify?: Array<{ phoneE164: string; body: string }>;
   decision: string;
   extracted?: any;
 };
@@ -109,6 +63,8 @@ function normalizeYesNo(text: string): "yes" | "no" | "maybe" | null {
   if (/(contado|efectivo|de contado|transferencia|cash)/.test(s)) return "no";
   if (/(finan|cr[eé]dito|cuota|cuotas|plan|pr[eé]stamo)/.test(s)) return "yes";
   if (/(capaz|puede ser|tal vez|no se|depende)/.test(s)) return "maybe";
+  // Common informal confirmations in WhatsApp
+  if (/\b(dale|mandale|de\s*una|listo|ok|okay|joya|perfecto|genial)\b/.test(s)) return "yes";
   if (/\b(si|sí|sisi|sii)\b/.test(s)) return "yes";
   if (/\b(no|nop)\b/.test(s)) return "no";
   return null;
@@ -164,41 +120,6 @@ function wantsPublicationLink(t: string) {
   );
 }
 
-function wantsAnotherOption(t: string) {
-  const s = t
-    .toLowerCase()
-    .trim()
-    .replace(/[!¡?.:,;]+/g, " ")
-    .replace(/\s+/g, " ");
-
-  // Common ways of asking for more options in WhatsApp.
-  return (
-    s === "otro" ||
-    s === "otra" ||
-    s.includes("ver otro") ||
-    s.includes("ver otra") ||
-    s.includes("otro auto") ||
-    s.includes("otra unidad") ||
-    s.includes("siguiente") ||
-    s.includes("otra opcion") ||
-    s.includes("otra opción") ||
-    s.includes("mas opciones") ||
-    s.includes("más opciones") ||
-    s.includes("otro modelo") ||
-    s.includes("otra alternativa")
-  );
-}
-
-function wantsPreviousOption(t: string) {
-  const s = t
-    .toLowerCase()
-    .trim()
-    .replace(/[!¡?.:,;]+/g, " ")
-    .replace(/\s+/g, " ");
-
-  return s === "anterior" || s === "atras" || s === "atrás" || s.includes("volver") || s.includes("opcion anterior") || s.includes("opción anterior");
-}
-
 function looksLikeNewSearchIntent(t: string) {
   const s = t.toLowerCase();
   if (looksLikeThanksOrAck(s)) return false;
@@ -212,6 +133,56 @@ function looksLikeNewSearchIntent(t: string) {
 function formatKm(km: number | null | undefined) {
   if (km == null || !Number.isFinite(Number(km))) return null;
   return Math.round(Number(km)).toLocaleString("es-AR");
+}
+
+function formatMoneyARS(n: number) {
+  const v = Math.max(0, Math.round(Number(n) || 0));
+  return `$ ${v.toLocaleString("es-AR")}`;
+}
+
+function frenchPayment(p: number, monthlyRate: number, months: number) {
+  const P = Math.max(0, Number(p) || 0);
+  const r = Math.max(0, Number(monthlyRate) || 0);
+  const n = Math.max(1, Math.round(Number(months) || 1));
+  if (r === 0) return P / n;
+  return (P * r) / (1 - Math.pow(1 + r, -n));
+}
+
+function buildFallbackQuoteText(params: {
+  priceARS: number;
+  downARS: number;
+  financedARS: number;
+  term: number;
+}) {
+  const priceARS = Math.max(0, Math.round(Number(params.priceARS) || 0));
+  const downARS = Math.max(0, Math.round(Number(params.downARS) || 0));
+  const financed = Math.max(0, Math.round(Number(params.financedARS) || 0));
+  const term = Math.max(1, Math.round(Number(params.term) || 1));
+
+  if (financed <= 0) {
+    return (
+      `Aprox. de cuotas:` +
+      `\n- Precio: ${formatMoneyARS(priceARS)}` +
+      `\n- Anticipo: ${formatMoneyARS(downARS)}` +
+      `\nCon ese anticipo, quedaría al contado (sin financiación).` +
+      `\n\n(Orientativo. El asesor te confirma con números finales.)`
+    );
+  }
+
+  const sinInteres = financed / term;
+  // Two reference monthly rates (very rough): 3% and 6%.
+  const cuotaLow = frenchPayment(financed, 0.03, term);
+  const cuotaHigh = frenchPayment(financed, 0.06, term);
+
+  return (
+    `Aprox. de cuotas:` +
+    `\n- Precio: ${formatMoneyARS(priceARS)}` +
+    `\n- Anticipo: ${formatMoneyARS(downARS)}` +
+    `\n- Monto a financiar: ${formatMoneyARS(financed)}` +
+    `\n- ${term} cuotas (sin interés): ${formatMoneyARS(sinInteres)}` +
+    `\n- ${term} cuotas (con interés, ejemplo 3%–6% mensual): entre ${formatMoneyARS(cuotaLow)} y ${formatMoneyARS(cuotaHigh)}` +
+    `\n\n(Es un estimado orientativo. La cuota real depende de la financiera, seguro y gastos.)`
+  );
 }
 
 function extractMotorAndVersionFromTitle(title: string) {
@@ -476,44 +447,14 @@ Lead actual (puede estar incompleto): ${JSON.stringify({
   return JSON.parse(content);
 }
 
-async function showOptionsAndStore(
-  supabase: any,
-  leadId: string,
-  lead: any,
-  opts?: { excludeIds?: string[]; mode?: "first" | "more"; skipUpdateIfEmpty?: boolean }
-) {
-  const result = await searchVehiclesClosest({
-    supabase,
-    lead,
-    limit: 3,
-    excludeIds: opts?.excludeIds ?? [],
-  });
-
-  const { text: baseText, suggestions } = formatVehicleOptions(result.suggestions, result.meta);
-
-  if (opts?.skipUpdateIfEmpty && !suggestions.length) {
-    return { replyText: baseText, suggestions };
-  }
-
-  // When the user asks for "otro/siguiente", keep the list header consistent.
-  let text = baseText;
-  if (opts?.mode === "more" && text) {
-    const parts = text.split("\n\n");
-    if (parts.length) parts[0] = "Otras opciones cercanas en stock son:";
-    text = parts.join("\n\n");
-  }
-
-  const store: SuggestionStoreV1 = {
-    v: 1,
-    page: 0,
-    pages: suggestions.length ? [suggestions.map((s) => String(s.id))] : [],
-    current: suggestions,
-  };
+async function showOptionsAndStore(supabase: any, leadId: string, lead: any) {
+  const result = await searchVehiclesClosest({ supabase, lead, limit: 3 });
+  const { text, suggestions } = formatVehicleOptions(result.suggestions, result.meta);
 
   await supabase
     .from("leads")
     .update({
-      last_vehicle_suggestions: store as any,
+      last_vehicle_suggestions: suggestions,
       selected_vehicle: null,
       selected_vehicle_id: null,
       conversation_state: "AWAITING_CHOICE",
@@ -533,92 +474,7 @@ Respondé 1, 2 o 3 para ver la ficha con fotos de la unidad.`,
   };
 }
 
-async function showMoreOptionsAndStore(supabase: any, leadId: string, lead: any) {
-  const store0 = toSuggestionStore(lead?.last_vehicle_suggestions);
-  const excludeIds = flattenPages(store0.pages);
-
-  const result = await searchVehiclesClosest({ supabase, lead, limit: 3, excludeIds });
-  const { text, suggestions } = formatVehicleOptions(result.suggestions, result.meta);
-
-  // If we couldn't find any further options, don't overwrite the last shown suggestions.
-  if (!suggestions.length) {
-    return { replyText: text, suggestions };
-  }
-
-  // Replace the header to avoid the "no encontré" message when the user is just paging.
-  const parts = String(text).split("\n\n");
-  if (parts.length) parts[0] = "Otras opciones cercanas en stock son:";
-  const text2 = parts.join("\n\n");
-
-  const pages = [...store0.pages, suggestions.map((s) => String(s.id))];
-  const store1: SuggestionStoreV1 = {
-    v: 1,
-    page: Math.max(0, pages.length - 1),
-    pages,
-    current: suggestions,
-  };
-
-  await supabase
-    .from("leads")
-    .update({
-      last_vehicle_suggestions: store1 as any,
-      selected_vehicle: null,
-      selected_vehicle_id: null,
-      conversation_state: "AWAITING_CHOICE",
-    })
-    .eq("id", leadId);
-
-  return {
-    replyText:
-      suggestions.length === 1
-        ? `${text2}\n\nSi querés ver la ficha con fotos, respondé 1.`
-        : `${text2}\n\nRespondé 1, 2 o 3 para ver la ficha con fotos de la unidad.`,
-    suggestions,
-  };
-}
-
-async function showPreviousOptionsAndStore(supabase: any, leadId: string, lead: any) {
-  const store0 = toSuggestionStore(lead?.last_vehicle_suggestions);
-  if (store0.page <= 0 || store0.pages.length <= 1) {
-    return { replyText: "Ya estás viendo las primeras opciones.", suggestions: store0.current };
-  }
-
-  const newPage = Math.max(0, store0.page - 1);
-  const ids = store0.pages[newPage] ?? [];
-  const fetched = await fetchSuggestionsByIds({ supabase, ids });
-  const { text, suggestions } = formatVehicleOptions(fetched.suggestions, fetched.meta);
-
-  if (!suggestions.length) {
-    return { replyText: "No encontré opciones anteriores (puede que hayan cambiado el stock).", suggestions: store0.current };
-  }
-
-  const parts = String(text).split("\n\n");
-  if (parts.length) parts[0] = "Opciones anteriores en stock son:";
-  const text2 = parts.join("\n\n");
-
-  const store1: SuggestionStoreV1 = { ...store0, page: newPage, current: suggestions };
-  await supabase
-    .from("leads")
-    .update({
-      last_vehicle_suggestions: store1 as any,
-      selected_vehicle: null,
-      selected_vehicle_id: null,
-      conversation_state: "AWAITING_CHOICE",
-    })
-    .eq("id", leadId);
-
-  return {
-    replyText:
-      suggestions.length === 1
-        ? `${text2}\n\nSi querés ver la ficha con fotos, respondé 1.`
-        : `${text2}\n\nRespondé 1, 2 o 3 para ver la ficha con fotos de la unidad.`,
-    suggestions,
-  };
-}
-
-function getSuggestionByChoice(raw: any, choice: 1 | 2 | 3) {
-  const store = toSuggestionStore(raw);
-  const suggestions = store.current;
+function getSuggestionByChoice(suggestions: VehicleSuggestion[] | null | undefined, choice: 1 | 2 | 3) {
   if (!Array.isArray(suggestions)) return null;
   return suggestions[choice - 1] ?? null;
 }
@@ -750,32 +606,11 @@ export async function runBotForIncomingMessage({
     };
   }
 
-  // Paging in AWAITING_CHOICE: "otro" / "anterior"
-  if (lead0.conversation_state === "AWAITING_CHOICE" && wantsPreviousOption(incomingText)) {
-    const prev = await showPreviousOptionsAndStore(supabase, lead0.id, lead0);
-    await saveBotRun(supabase, lead0.id, "show_previous_options", {
-      page: toSuggestionStore(lead0.last_vehicle_suggestions).page,
-    });
-    return { decision: "show_previous_options", replyText: prev.replyText };
-  }
-
-  if (lead0.conversation_state === "AWAITING_CHOICE" && wantsAnotherOption(incomingText)) {
-    const more = await showMoreOptionsAndStore(supabase, lead0.id, lead0);
-    if (!more?.suggestions?.length) {
-      return {
-        decision: "no_more_options",
-        replyText:
-          "Por ahora no veo más opciones cercanas con ese presupuesto. Si querés, decime qué modelo buscás (ej: Suran, Amarok, SUV) o un rango de presupuesto y te paso otras.",
-      };
-    }
-    const store = toSuggestionStore(lead0.last_vehicle_suggestions);
-    await saveBotRun(supabase, lead0.id, "show_more_options", { exclude_count: flattenPages(store.pages).length });
-    return { decision: "show_more_options", replyText: more.replyText };
-  }
-
+  // Choice fast-path: "1" / "2" / "3" (only when we are awaiting a choice)
   const choice = parseChoice(incomingText);
   if (choice && lead0.conversation_state === "AWAITING_CHOICE" && lead0.last_vehicle_suggestions) {
-    const picked = getSuggestionByChoice(lead0.last_vehicle_suggestions, choice);
+    const suggestions = lead0.last_vehicle_suggestions as VehicleSuggestion[];
+    const picked = getSuggestionByChoice(suggestions, choice);
     if (picked) {
       // Save selection
       await supabase
@@ -806,13 +641,19 @@ export async function runBotForIncomingMessage({
       const pics = Array.isArray(picked.pictures) ? picked.pictures.filter(Boolean) : [];
       const first4 = pics.slice(0, 4);
 
-      const outgoing: NonNullable<BotResult["outgoing"]> = [{ type: "text", body: `${card}\n\nTe paso 4 fotos 👇` }];
+      // Important: keep a single text message before the images to avoid WhatsApp ordering quirks
+      // where the trailing text may appear before the last image.
+      const outgoing: NonNullable<BotResult["outgoing"]> = [
+        {
+          type: "text",
+          body:
+            `${card}` +
+            `\n\nTe paso 4 fotos a continuación.` +
+            `\n\n¿Querés que te arme un aproximado de cuotas (sin compromiso)? (sí/no)` +
+            `\nSi querés más fotos, escribí: más fotos.`,
+        },
+      ];
       for (const link of first4) outgoing.push({ type: "image", link });
-      outgoing.push({
-        type: "text",
-        body:
-          "Si querés, te hago un aproximado de cuotas (sin compromiso) para que te des una idea. ¿Te lo armo? (sí/no)\n\nSi querés más fotos, escribí: más fotos.",
-      });
 
       return { decision: "vehicle_card_and_photos", outgoing };
     }
@@ -937,14 +778,29 @@ export async function runBotForIncomingMessage({
     }
     const montoFinanciado = Math.max(0, Math.round(Number(sv.price_ars) - downARS));
     const quote = montoFinanciado > 0 ? await getCreditCarQuote({ montoARS: montoFinanciado, modeloYear: sv.year ?? undefined }) : null;
-    const quoteLine = quote?.summaryText ? `\n\nSimulación aprox.:\n${quote.summaryText}` : "";
+    const creditCarText = quote?.summaryText && /cuota|cuotas|\d/.test(String(quote.summaryText)) ? String(quote.summaryText).trim() : null;
+    const fallbackText = buildFallbackQuoteText({ priceARS: Number(sv.price_ars), downARS, financedARS: montoFinanciado, term });
+    const quoteText = creditCarText ? `Simulación aprox. (CreditCar):\n${creditCarText}\n\n${fallbackText}` : fallbackText;
 
     await supabase
       .from("leads")
       .update({ selected_vehicle: { ...sv, finance_term: term, finance_amount_ars: montoFinanciado }, conversation_state: "AWAITING_TRADE_IN" })
       .eq("id", lead0.id);
 
-    return { decision: "quote_done_ask_tradein", replyText: `Listo.${quoteLine}\n\n¿Tenés usado para permuta?` };
+    const notifyPhone = process.env.QUOTES_NOTIFY_PHONE_E164 ?? "+5492494621182";
+    const notifyBody =
+      `CUOTAS SOLICITADAS` +
+      `\nUnidad: ${sv.title}${sv.year ? ` (${sv.year})` : ""}` +
+      `\nPrecio: ${formatMoneyARS(Number(sv.price_ars))}` +
+      `\nAnticipo: ${formatMoneyARS(downARS)}` +
+      `\nA financiar: ${formatMoneyARS(montoFinanciado)}` +
+      `\nPlazo: ${term} cuotas`;
+
+    return {
+      decision: "quote_done_ask_tradein",
+      replyText: `Listo.\n\n${quoteText}\n\n¿Tenés usado para permuta?`,
+      notify: [{ phoneE164: notifyPhone, body: notifyBody }],
+    };
   }
 
   // Finance fast-path when we are awaiting it
