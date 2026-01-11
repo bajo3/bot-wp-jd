@@ -40,7 +40,24 @@ function pickNumbers(obj: any): number[] {
   return nums;
 }
 
+
+function summarizeText(rawText: string): string {
+  // Try to extract cuota/plazo numbers from plain text/HTML.
+  const text = rawText.replace(/\s+/g, " ").trim();
+  // Common patterns: "24 cuotas" and "cuota 123.456"
+  const plazoMatch = text.match(/(\d{1,3})\s*(cuotas|meses)/i);
+  const cuotaMatch = text.match(/cuota\s*(aprox\.?|mensual)?\s*[:\-]?\s*\$?\s*([\d\.\,]+)/i);
+  const parts: string[] = [];
+  if (plazoMatch) parts.push(`${plazoMatch[1]} cuotas`);
+  if (cuotaMatch) parts.push(`cuota aprox. ${cuotaMatch[2]}`);
+  if (parts.length) return parts.join(" — ");
+  // Last resort: return a short snippet so we know something came back.
+  return text.slice(0, 140) + (text.length > 140 ? "…" : "");
+}
+
 function summarize(raw: any): string {
+  if (typeof raw === "string") return summarizeText(raw);
+
   // Heuristic summary:
   // - If it returns an array of options, show up to 3 lines.
   if (Array.isArray(raw)) {
@@ -84,22 +101,76 @@ function summarize(raw: any): string {
   return "Simulación disponible.";
 }
 
-export async function getCreditCarQuote(params: { montoARS: number; modeloYear?: number }): Promise<CreditCarQuote | null> {
+export async function getCreditCarQuote(params: { montoARS: number; modeloYear?: number; term?: number }): Promise<CreditCarQuote | null> {
   const { montoARS } = params;
   const modeloYear = params.modeloYear ?? new Date().getFullYear();
+  const term = params.term;
+
   const url = `https://api.cotizadorcreditcar.com.ar/2?monto=${encodeURIComponent(String(montoARS))}&modelo=${encodeURIComponent(
     String(modeloYear)
   )}`;
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 8000);
+
   try {
-    const res = await fetch(url, { method: "GET" });
-    if (!res.ok) return null;
-    const raw = await res.json();
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "application/json,text/plain,*/*",
+        "User-Agent": "Mozilla/5.0 (compatible; JD-AutoBot/1.0)",
+      },
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      return {
+        raw: { status: res.status, statusText: res.statusText, body: txt.slice(0, 600) },
+        summaryText: txt ? summarizeText(txt) : `No se pudo consultar CreditCar (HTTP ${res.status}).`,
+      };
+    }
+
+    const contentType = res.headers.get("content-type") || "";
+    let raw: any;
+
+    if (contentType.includes("application/json")) {
+      raw = await res.json();
+    } else {
+      const txt = await res.text();
+      try {
+        raw = JSON.parse(txt);
+      } catch {
+        raw = txt;
+      }
+    }
+
+    // If it returns a list of options with plazo/cuotas, try to pick the closest to the requested term.
+    if (term && Array.isArray(raw)) {
+      const withPlazo = raw
+        .map((o: any) => {
+          const plazo = Number(o?.plazo ?? o?.meses ?? o?.cantidad_cuotas ?? o?.cuotas ?? NaN);
+          return { o, plazo };
+        })
+        .filter((x: any) => Number.isFinite(x.plazo));
+
+      if (withPlazo.length) {
+        withPlazo.sort((a: any, b: any) => Math.abs(a.plazo - term) - Math.abs(b.plazo - term));
+        raw = [withPlazo[0].o, ...withPlazo.slice(1, 3).map((x: any) => x.o)];
+      }
+    }
+
     return {
       raw,
       summaryText: summarize(raw),
     };
-  } catch {
-    return null;
+  } catch (e: any) {
+    const msg = e?.name === "AbortError" ? "timeout" : String(e?.message || e);
+    return {
+      raw: { error: msg },
+      summaryText: `No se pudo consultar CreditCar (${msg}).`,
+    };
+  } finally {
+    clearTimeout(timeout);
   }
 }

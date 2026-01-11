@@ -19,8 +19,6 @@ type LeadRow = any;
 export type BotResult = {
   replyText?: string;
   outgoing?: Array<{ type: "text"; body: string } | { type: "image"; link: string; caption?: string }>; 
-  /** Optional extra notifications (e.g. send a summary to an internal/test number). */
-  notify?: Array<{ phoneE164: string; body: string }>;
   decision: string;
   extracted?: any;
 };
@@ -63,8 +61,6 @@ function normalizeYesNo(text: string): "yes" | "no" | "maybe" | null {
   if (/(contado|efectivo|de contado|transferencia|cash)/.test(s)) return "no";
   if (/(finan|cr[eé]dito|cuota|cuotas|plan|pr[eé]stamo)/.test(s)) return "yes";
   if (/(capaz|puede ser|tal vez|no se|depende)/.test(s)) return "maybe";
-  // Common informal confirmations in WhatsApp
-  if (/\b(dale|mandale|de\s*una|listo|ok|okay|joya|perfecto|genial)\b/.test(s)) return "yes";
   if (/\b(si|sí|sisi|sii)\b/.test(s)) return "yes";
   if (/\b(no|nop)\b/.test(s)) return "no";
   return null;
@@ -133,56 +129,6 @@ function looksLikeNewSearchIntent(t: string) {
 function formatKm(km: number | null | undefined) {
   if (km == null || !Number.isFinite(Number(km))) return null;
   return Math.round(Number(km)).toLocaleString("es-AR");
-}
-
-function formatMoneyARS(n: number) {
-  const v = Math.max(0, Math.round(Number(n) || 0));
-  return `$ ${v.toLocaleString("es-AR")}`;
-}
-
-function frenchPayment(p: number, monthlyRate: number, months: number) {
-  const P = Math.max(0, Number(p) || 0);
-  const r = Math.max(0, Number(monthlyRate) || 0);
-  const n = Math.max(1, Math.round(Number(months) || 1));
-  if (r === 0) return P / n;
-  return (P * r) / (1 - Math.pow(1 + r, -n));
-}
-
-function buildFallbackQuoteText(params: {
-  priceARS: number;
-  downARS: number;
-  financedARS: number;
-  term: number;
-}) {
-  const priceARS = Math.max(0, Math.round(Number(params.priceARS) || 0));
-  const downARS = Math.max(0, Math.round(Number(params.downARS) || 0));
-  const financed = Math.max(0, Math.round(Number(params.financedARS) || 0));
-  const term = Math.max(1, Math.round(Number(params.term) || 1));
-
-  if (financed <= 0) {
-    return (
-      `Aprox. de cuotas:` +
-      `\n- Precio: ${formatMoneyARS(priceARS)}` +
-      `\n- Anticipo: ${formatMoneyARS(downARS)}` +
-      `\nCon ese anticipo, quedaría al contado (sin financiación).` +
-      `\n\n(Orientativo. El asesor te confirma con números finales.)`
-    );
-  }
-
-  const sinInteres = financed / term;
-  // Two reference monthly rates (very rough): 3% and 6%.
-  const cuotaLow = frenchPayment(financed, 0.03, term);
-  const cuotaHigh = frenchPayment(financed, 0.06, term);
-
-  return (
-    `Aprox. de cuotas:` +
-    `\n- Precio: ${formatMoneyARS(priceARS)}` +
-    `\n- Anticipo: ${formatMoneyARS(downARS)}` +
-    `\n- Monto a financiar: ${formatMoneyARS(financed)}` +
-    `\n- ${term} cuotas (sin interés): ${formatMoneyARS(sinInteres)}` +
-    `\n- ${term} cuotas (con interés, ejemplo 3%–6% mensual): entre ${formatMoneyARS(cuotaLow)} y ${formatMoneyARS(cuotaHigh)}` +
-    `\n\n(Es un estimado orientativo. La cuota real depende de la financiera, seguro y gastos.)`
-  );
 }
 
 function extractMotorAndVersionFromTitle(title: string) {
@@ -641,19 +587,13 @@ export async function runBotForIncomingMessage({
       const pics = Array.isArray(picked.pictures) ? picked.pictures.filter(Boolean) : [];
       const first4 = pics.slice(0, 4);
 
-      // Important: keep a single text message before the images to avoid WhatsApp ordering quirks
-      // where the trailing text may appear before the last image.
-      const outgoing: NonNullable<BotResult["outgoing"]> = [
-        {
-          type: "text",
-          body:
-            `${card}` +
-            `\n\nTe paso 4 fotos a continuación.` +
-            `\n\n¿Querés que te arme un aproximado de cuotas (sin compromiso)? (sí/no)` +
-            `\nSi querés más fotos, escribí: más fotos.`,
-        },
-      ];
+      const outgoing: NonNullable<BotResult["outgoing"]> = [{ type: "text", body: `${card}\n\nTe paso 4 fotos 👇` }];
       for (const link of first4) outgoing.push({ type: "image", link });
+      outgoing.push({
+        type: "text",
+        body:
+          "Si querés, te hago un aproximado de cuotas (sin compromiso) para que te des una idea. ¿Te lo armo? (sí/no)\n\nSi querés más fotos, escribí: más fotos.",
+      });
 
       return { decision: "vehicle_card_and_photos", outgoing };
     }
@@ -777,30 +717,15 @@ export async function runBotForIncomingMessage({
       else downARS = moneyToARS(dp.value, dp.currency ?? "ARS", blueSell);
     }
     const montoFinanciado = Math.max(0, Math.round(Number(sv.price_ars) - downARS));
-    const quote = montoFinanciado > 0 ? await getCreditCarQuote({ montoARS: montoFinanciado, modeloYear: sv.year ?? undefined }) : null;
-    const creditCarText = quote?.summaryText && /cuota|cuotas|\d/.test(String(quote.summaryText)) ? String(quote.summaryText).trim() : null;
-    const fallbackText = buildFallbackQuoteText({ priceARS: Number(sv.price_ars), downARS, financedARS: montoFinanciado, term });
-    const quoteText = creditCarText ? `Simulación aprox. (CreditCar):\n${creditCarText}\n\n${fallbackText}` : fallbackText;
+    const quote = montoFinanciado > 0 ? await getCreditCarQuote({ montoARS: montoFinanciado, modeloYear: sv.year ?? undefined, term }) : null;
+    const quoteLine = quote?.summaryText ? `\n\nSimulación aprox.:\n${quote.summaryText}` : "";
 
     await supabase
       .from("leads")
       .update({ selected_vehicle: { ...sv, finance_term: term, finance_amount_ars: montoFinanciado }, conversation_state: "AWAITING_TRADE_IN" })
       .eq("id", lead0.id);
 
-    const notifyPhone = process.env.QUOTES_NOTIFY_PHONE_E164 ?? "+5492494621182";
-    const notifyBody =
-      `CUOTAS SOLICITADAS` +
-      `\nUnidad: ${sv.title}${sv.year ? ` (${sv.year})` : ""}` +
-      `\nPrecio: ${formatMoneyARS(Number(sv.price_ars))}` +
-      `\nAnticipo: ${formatMoneyARS(downARS)}` +
-      `\nA financiar: ${formatMoneyARS(montoFinanciado)}` +
-      `\nPlazo: ${term} cuotas`;
-
-    return {
-      decision: "quote_done_ask_tradein",
-      replyText: `Listo.\n\n${quoteText}\n\n¿Tenés usado para permuta?`,
-      notify: [{ phoneE164: notifyPhone, body: notifyBody }],
-    };
+    return { decision: "quote_done_ask_tradein", replyText: `Listo.${quoteLine}\n\n¿Tenés usado para permuta?` };
   }
 
   // Finance fast-path when we are awaiting it

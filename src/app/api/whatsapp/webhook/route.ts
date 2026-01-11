@@ -156,11 +156,6 @@ export async function POST(req: Request) {
   // correr bot
   const result = await runBotForIncomingMessage({ supabase, lead, incomingText: text });
 
-  // Optional: force all outgoing messages to a fixed number (useful for testing).
-  // Example: FORCE_OUTGOING_PHONE_E164=+5492494621182
-  const forcedDest = (process.env.FORCE_OUTGOING_PHONE_E164 ?? "").trim();
-  const destPhoneE164 = forcedDest || phoneE164;
-
   const outgoing = result?.outgoing?.length
     ? result.outgoing
     : result?.replyText
@@ -172,38 +167,24 @@ export async function POST(req: Request) {
 
     for (const msgOut of outgoing) {
       if (msgOut.type === "text") {
-        await sendWhatsAppText(destPhoneE164, msgOut.body);
+        await sendWhatsAppText(phoneE164, msgOut.body);
         partsForTraining.push(msgOut.body);
         await supabase.from("messages").insert({
           lead_id: lead.id,
           direction: "out",
           text: msgOut.body,
-          raw_payload: { decision: result?.decision ?? null, type: "text", to: destPhoneE164 },
+          raw_payload: { decision: result?.decision ?? null, type: "text" },
         });
       }
 
       if (msgOut.type === "image") {
-        await sendWhatsAppImage(destPhoneE164, msgOut.link, msgOut.caption);
+        await sendWhatsAppImage(phoneE164, msgOut.link, msgOut.caption);
         await supabase.from("messages").insert({
           lead_id: lead.id,
           direction: "out",
           text: msgOut.caption ? `[[image]] ${msgOut.caption}` : "[[image]]",
-          raw_payload: { decision: result?.decision ?? null, type: "image", link: msgOut.link, to: destPhoneE164 },
+          raw_payload: { decision: result?.decision ?? null, type: "image", link: msgOut.link },
         });
-      }
-    }
-
-    // Send optional internal/test notifications.
-    // This is intentionally not stored in `messages` to avoid polluting the chat history.
-    if (Array.isArray((result as any)?.notify)) {
-      for (const n of (result as any).notify) {
-        if (n?.phoneE164 && n?.body) {
-          try {
-            await sendWhatsAppText(String(n.phoneE164), String(n.body));
-          } catch {
-            // ignore notify failures
-          }
-        }
       }
     }
 
