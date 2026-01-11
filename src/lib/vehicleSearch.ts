@@ -153,7 +153,8 @@ export async function searchVehiclesClosest({
   const { data, error } = await q.limit(300);
   if (error) throw error;
 
-  const vehicles: VehicleRow[] = (data ?? []) as any;
+  const exclude = new Set((excludeIds ?? []).map(String));
+  const vehicles: VehicleRow[] = ((data ?? []) as any).filter((v: any) => !exclude.has(String(v?.id)));
 
   const terms = tokenizeQuery(String(lead?.car_query ?? ""));
   const { amount: budgetAmount, currency: budgetCurrency } = parseBudgetFromLead(lead);
@@ -169,9 +170,27 @@ export async function searchVehiclesClosest({
   let usedFallbackWithoutQuery = false;
 
   if (terms.length) {
-    const byQuery = vehicles.filter((v) => matchesQuery(v, terms));
-    if (byQuery.length) filtered = byQuery;
-    else usedFallbackWithoutQuery = true;
+    const byQueryAnd = vehicles.filter((v) => matchesQuery(v, terms));
+    if (byQueryAnd.length) {
+      filtered = byQueryAnd;
+    } else {
+      // If the user types multiple words/models (e.g. "Suran Amarok"), an AND match is too strict.
+      // Try a best-effort OR match before falling back to all vehicles.
+      const byQueryOr =
+        terms.length > 1
+          ? vehicles.filter((v) => {
+              const hay = [v.title, v.brand, v.model].map(normStr).join(" ");
+              return terms.some((t) => hay.includes(t));
+            })
+          : [];
+
+      if (byQueryOr.length) {
+        filtered = byQueryOr;
+        usedFallbackWithoutQuery = true; // not an exact match
+      } else {
+        usedFallbackWithoutQuery = true;
+      }
+    }
   }
 
   let suggestions = toSuggestions(filtered);
@@ -206,16 +225,65 @@ export async function searchVehiclesClosest({
     suggestions.sort((a, b) => a.price_ars - b.price_ars);
   }
 
-  // Exclude previously shown vehicles (used for "otro" / pagination)
-  if (Array.isArray(excludeIds) && excludeIds.length) {
-    const ex = new Set(excludeIds.map(String));
-    suggestions = suggestions.filter((s) => !ex.has(String(s.id)));
-  }
-
   return {
     suggestions: suggestions.slice(0, Math.max(1, limit)),
     meta: {
       used_fallback_without_query: usedFallbackWithoutQuery,
+      blue_sell: blueSell,
+    },
+  };
+}
+
+// Fetch specific vehicles by ids (used for paging "anterior").
+// Keeps the returned list in the same order as `ids`.
+export async function fetchSuggestionsByIds({
+  supabase,
+  ids,
+}: {
+  supabase: SupabaseClient;
+  ids: string[];
+}): Promise<SearchResult> {
+  const cleanIds = (ids ?? []).map(String).filter(Boolean);
+  if (!cleanIds.length) {
+    return {
+      suggestions: [],
+      meta: {
+        used_fallback_without_query: false,
+        blue_sell: 0,
+      },
+    };
+  }
+
+  const { sell: blueSell } = await getBlueSellRate(supabase, 120);
+
+  let q = supabase
+    .from("vehicles")
+    .select(
+      "id, title, brand, model, year, price, currency, pictures, permalink, km, Km, transmission, Caja, color, status, dealership_id"
+    )
+    .in("id", cleanIds);
+
+  const dealershipId = process.env.DEALERSHIP_ID;
+  if (dealershipId) q = q.eq("dealership_id", dealershipId);
+
+  const { data, error } = await q.limit(300);
+  if (error) throw error;
+
+  const byId = new Map<string, VehicleRow>();
+  for (const v of (data ?? []) as any[]) byId.set(String((v as any)?.id), v as any);
+
+  const suggestions: VehicleSuggestion[] = [];
+  for (const id of cleanIds) {
+    const row = byId.get(String(id));
+    if (!row) continue;
+    const s = vehicleToSuggestion(row, blueSell);
+    if (s) suggestions.push(s);
+  }
+
+  return {
+    suggestions,
+    meta: {
+      used_fallback_without_query: false,
       blue_sell: blueSell,
     },
   };

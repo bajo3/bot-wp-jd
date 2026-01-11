@@ -10,11 +10,59 @@
   - Keeps handoff-outbox in bot_runs (provider-agnostic)
 */
 
-import { searchVehiclesClosest, formatVehicleOptions, type VehicleSuggestion } from "@/lib/vehicleSearch";
+import {
+  searchVehiclesClosest,
+  fetchSuggestionsByIds,
+  formatVehicleOptions,
+  type VehicleSuggestion,
+} from "@/lib/vehicleSearch";
 import { getCreditCarQuote } from "@/lib/creditcar";
 import { getBlueSellRate, moneyToARS } from "@/lib/exchangeRate";
 
 type LeadRow = any;
+
+type SuggestionStoreV1 = {
+  v: 1;
+  page: number;
+  pages: string[][]; // arrays of vehicle ids per page
+  current: VehicleSuggestion[];
+};
+
+function toSuggestionStore(raw: any): SuggestionStoreV1 {
+  // Legacy: raw is an array of suggestions.
+  if (Array.isArray(raw)) {
+    const ids = raw.map((x: any) => String(x?.id)).filter(Boolean);
+    return { v: 1, page: 0, pages: ids.length ? [ids] : [], current: raw as any };
+  }
+
+  // New: object store
+  if (raw && typeof raw === "object" && raw.v === 1 && Array.isArray(raw.pages) && Array.isArray(raw.current)) {
+    const page = Number(raw.page ?? 0);
+    const pages = raw.pages.map((p: any) => (Array.isArray(p) ? p.map(String).filter(Boolean) : [])).filter(Boolean);
+    return {
+      v: 1,
+      page: Number.isFinite(page) ? Math.max(0, Math.min(page, Math.max(0, pages.length - 1))) : 0,
+      pages,
+      current: raw.current as any,
+    };
+  }
+
+  return { v: 1, page: 0, pages: [], current: [] };
+}
+
+function flattenPages(pages: string[][]): string[] {
+  const out: string[] = [];
+  for (const p of pages) for (const id of p) out.push(String(id));
+  // unique while preserving order
+  const seen = new Set<string>();
+  const uniq: string[] = [];
+  for (const id of out) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    uniq.push(id);
+  }
+  return uniq;
+}
 
 export type BotResult = {
   replyText?: string;
@@ -119,14 +167,36 @@ function wantsPublicationLink(t: string) {
 function wantsAnotherOption(t: string) {
   const s = t
     .toLowerCase()
+    .trim()
     .replace(/[!¡?.:,;]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/\s+/g, " ");
 
-  // Typical phrases: "quiero ver otro", "otra opción", "siguiente", "mostrame más".
-  if (/\b(siguiente|otra|otro|alternativa|mas opciones|más opciones)\b/.test(s)) return true;
-  if (/\b(quiero|mostrame|pasame|ver)\b.*\b(otro|otra|siguiente|alternativa)\b/.test(s)) return true;
-  return false;
+  // Common ways of asking for more options in WhatsApp.
+  return (
+    s === "otro" ||
+    s === "otra" ||
+    s.includes("ver otro") ||
+    s.includes("ver otra") ||
+    s.includes("otro auto") ||
+    s.includes("otra unidad") ||
+    s.includes("siguiente") ||
+    s.includes("otra opcion") ||
+    s.includes("otra opción") ||
+    s.includes("mas opciones") ||
+    s.includes("más opciones") ||
+    s.includes("otro modelo") ||
+    s.includes("otra alternativa")
+  );
+}
+
+function wantsPreviousOption(t: string) {
+  const s = t
+    .toLowerCase()
+    .trim()
+    .replace(/[!¡?.:,;]+/g, " ")
+    .replace(/\s+/g, " ");
+
+  return s === "anterior" || s === "atras" || s === "atrás" || s.includes("volver") || s.includes("opcion anterior") || s.includes("opción anterior");
 }
 
 function looksLikeNewSearchIntent(t: string) {
@@ -406,14 +476,44 @@ Lead actual (puede estar incompleto): ${JSON.stringify({
   return JSON.parse(content);
 }
 
-async function showOptionsAndStore(supabase: any, leadId: string, lead: any) {
-  const result = await searchVehiclesClosest({ supabase, lead, limit: 3 });
-  const { text, suggestions } = formatVehicleOptions(result.suggestions, result.meta);
+async function showOptionsAndStore(
+  supabase: any,
+  leadId: string,
+  lead: any,
+  opts?: { excludeIds?: string[]; mode?: "first" | "more"; skipUpdateIfEmpty?: boolean }
+) {
+  const result = await searchVehiclesClosest({
+    supabase,
+    lead,
+    limit: 3,
+    excludeIds: opts?.excludeIds ?? [],
+  });
+
+  const { text: baseText, suggestions } = formatVehicleOptions(result.suggestions, result.meta);
+
+  if (opts?.skipUpdateIfEmpty && !suggestions.length) {
+    return { replyText: baseText, suggestions };
+  }
+
+  // When the user asks for "otro/siguiente", keep the list header consistent.
+  let text = baseText;
+  if (opts?.mode === "more" && text) {
+    const parts = text.split("\n\n");
+    if (parts.length) parts[0] = "Otras opciones cercanas en stock son:";
+    text = parts.join("\n\n");
+  }
+
+  const store: SuggestionStoreV1 = {
+    v: 1,
+    page: 0,
+    pages: suggestions.length ? [suggestions.map((s) => String(s.id))] : [],
+    current: suggestions,
+  };
 
   await supabase
     .from("leads")
     .update({
-      last_vehicle_suggestions: suggestions,
+      last_vehicle_suggestions: store as any,
       selected_vehicle: null,
       selected_vehicle_id: null,
       conversation_state: "AWAITING_CHOICE",
@@ -433,7 +533,92 @@ Respondé 1, 2 o 3 para ver la ficha con fotos de la unidad.`,
   };
 }
 
-function getSuggestionByChoice(suggestions: VehicleSuggestion[] | null | undefined, choice: 1 | 2 | 3) {
+async function showMoreOptionsAndStore(supabase: any, leadId: string, lead: any) {
+  const store0 = toSuggestionStore(lead?.last_vehicle_suggestions);
+  const excludeIds = flattenPages(store0.pages);
+
+  const result = await searchVehiclesClosest({ supabase, lead, limit: 3, excludeIds });
+  const { text, suggestions } = formatVehicleOptions(result.suggestions, result.meta);
+
+  // If we couldn't find any further options, don't overwrite the last shown suggestions.
+  if (!suggestions.length) {
+    return { replyText: text, suggestions };
+  }
+
+  // Replace the header to avoid the "no encontré" message when the user is just paging.
+  const parts = String(text).split("\n\n");
+  if (parts.length) parts[0] = "Otras opciones cercanas en stock son:";
+  const text2 = parts.join("\n\n");
+
+  const pages = [...store0.pages, suggestions.map((s) => String(s.id))];
+  const store1: SuggestionStoreV1 = {
+    v: 1,
+    page: Math.max(0, pages.length - 1),
+    pages,
+    current: suggestions,
+  };
+
+  await supabase
+    .from("leads")
+    .update({
+      last_vehicle_suggestions: store1 as any,
+      selected_vehicle: null,
+      selected_vehicle_id: null,
+      conversation_state: "AWAITING_CHOICE",
+    })
+    .eq("id", leadId);
+
+  return {
+    replyText:
+      suggestions.length === 1
+        ? `${text2}\n\nSi querés ver la ficha con fotos, respondé 1.`
+        : `${text2}\n\nRespondé 1, 2 o 3 para ver la ficha con fotos de la unidad.`,
+    suggestions,
+  };
+}
+
+async function showPreviousOptionsAndStore(supabase: any, leadId: string, lead: any) {
+  const store0 = toSuggestionStore(lead?.last_vehicle_suggestions);
+  if (store0.page <= 0 || store0.pages.length <= 1) {
+    return { replyText: "Ya estás viendo las primeras opciones.", suggestions: store0.current };
+  }
+
+  const newPage = Math.max(0, store0.page - 1);
+  const ids = store0.pages[newPage] ?? [];
+  const fetched = await fetchSuggestionsByIds({ supabase, ids });
+  const { text, suggestions } = formatVehicleOptions(fetched.suggestions, fetched.meta);
+
+  if (!suggestions.length) {
+    return { replyText: "No encontré opciones anteriores (puede que hayan cambiado el stock).", suggestions: store0.current };
+  }
+
+  const parts = String(text).split("\n\n");
+  if (parts.length) parts[0] = "Opciones anteriores en stock son:";
+  const text2 = parts.join("\n\n");
+
+  const store1: SuggestionStoreV1 = { ...store0, page: newPage, current: suggestions };
+  await supabase
+    .from("leads")
+    .update({
+      last_vehicle_suggestions: store1 as any,
+      selected_vehicle: null,
+      selected_vehicle_id: null,
+      conversation_state: "AWAITING_CHOICE",
+    })
+    .eq("id", leadId);
+
+  return {
+    replyText:
+      suggestions.length === 1
+        ? `${text2}\n\nSi querés ver la ficha con fotos, respondé 1.`
+        : `${text2}\n\nRespondé 1, 2 o 3 para ver la ficha con fotos de la unidad.`,
+    suggestions,
+  };
+}
+
+function getSuggestionByChoice(raw: any, choice: 1 | 2 | 3) {
+  const store = toSuggestionStore(raw);
+  const suggestions = store.current;
   if (!Array.isArray(suggestions)) return null;
   return suggestions[choice - 1] ?? null;
 }
@@ -565,11 +750,32 @@ export async function runBotForIncomingMessage({
     };
   }
 
-  // Choice fast-path: "1" / "2" / "3" (only when we are awaiting a choice)
+  // Paging in AWAITING_CHOICE: "otro" / "anterior"
+  if (lead0.conversation_state === "AWAITING_CHOICE" && wantsPreviousOption(incomingText)) {
+    const prev = await showPreviousOptionsAndStore(supabase, lead0.id, lead0);
+    await saveBotRun(supabase, lead0.id, "show_previous_options", {
+      page: toSuggestionStore(lead0.last_vehicle_suggestions).page,
+    });
+    return { decision: "show_previous_options", replyText: prev.replyText };
+  }
+
+  if (lead0.conversation_state === "AWAITING_CHOICE" && wantsAnotherOption(incomingText)) {
+    const more = await showMoreOptionsAndStore(supabase, lead0.id, lead0);
+    if (!more?.suggestions?.length) {
+      return {
+        decision: "no_more_options",
+        replyText:
+          "Por ahora no veo más opciones cercanas con ese presupuesto. Si querés, decime qué modelo buscás (ej: Suran, Amarok, SUV) o un rango de presupuesto y te paso otras.",
+      };
+    }
+    const store = toSuggestionStore(lead0.last_vehicle_suggestions);
+    await saveBotRun(supabase, lead0.id, "show_more_options", { exclude_count: flattenPages(store.pages).length });
+    return { decision: "show_more_options", replyText: more.replyText };
+  }
+
   const choice = parseChoice(incomingText);
   if (choice && lead0.conversation_state === "AWAITING_CHOICE" && lead0.last_vehicle_suggestions) {
-    const suggestions = lead0.last_vehicle_suggestions as VehicleSuggestion[];
-    const picked = getSuggestionByChoice(suggestions, choice);
+    const picked = getSuggestionByChoice(lead0.last_vehicle_suggestions, choice);
     if (picked) {
       // Save selection
       await supabase
@@ -630,53 +836,6 @@ export async function runBotForIncomingMessage({
     if (sv.permalink) {
       return { decision: "share_publication_link", replyText: `Acá tenés la publicación: ${sv.permalink}` };
     }
-  }
-
-  // "Otro" / "siguiente" option handling.
-  // Without this, users who reply "quiero ver otro" can get stuck seeing the same list again.
-  if (wantsAnotherOption(incomingText)) {
-    const prev = Array.isArray(lead0.last_vehicle_suggestions)
-      ? (lead0.last_vehicle_suggestions as VehicleSuggestion[])
-      : [];
-
-    const excludeIds = Array.from(
-      new Set(
-        [
-          ...prev.map((s) => String((s as any)?.id)).filter(Boolean),
-          lead0.selected_vehicle_id ? String(lead0.selected_vehicle_id) : null,
-        ].filter(Boolean) as string[]
-      )
-    );
-
-    const next = await searchVehiclesClosest({ supabase, lead: lead0, limit: 3, excludeIds });
-
-    if (!next.suggestions.length) {
-      return {
-        decision: "no_more_options",
-        replyText:
-          "Ahora mismo no tengo más opciones cercanas en stock con ese presupuesto. Si querés, decime 1–2 modelos que te interesen o si podés estirarte un poco y te paso alternativas.",
-      };
-    }
-
-    const { text, suggestions } = formatVehicleOptions(next.suggestions, next.meta);
-
-    await supabase
-      .from("leads")
-      .update({
-        last_vehicle_suggestions: suggestions,
-        selected_vehicle: null,
-        selected_vehicle_id: null,
-        conversation_state: "AWAITING_CHOICE",
-      })
-      .eq("id", lead0.id);
-
-    return {
-      decision: "show_next_options",
-      replyText:
-        suggestions.length === 1
-          ? `${text}\n\nSi querés ver la ficha con fotos, respondé 1.`
-          : `${text}\n\nRespondé 1, 2 o 3 para ver la ficha con fotos de la unidad.`,
-    };
   }
 
   // Used vehicle details flow (sell/trade)
