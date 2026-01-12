@@ -56,6 +56,48 @@ function hasAdvisorKeyword(t: string) {
   return s.includes("hablar con asesor") || s.includes("asesor") || s.includes("vendedor") || s.includes("humano");
 }
 
+function isMenuKeyword(t: string) {
+  const s = t.trim().toLowerCase();
+  return s === "menu" || s === "menú" || s === "inicio" || s === "opciones" || s === "9";
+}
+
+function mainMenuText() {
+  return (
+    "Menú (respondé con un número):\n" +
+    "1) Ver catálogo\n" +
+    "2) Buscar por modelo\n" +
+    "3) Simular cuotas\n" +
+    "4) Tasar / tomar usado\n" +
+    "5) Hablar con asesor\n" +
+    "6) Ubicación / horarios"
+  );
+}
+
+function parseMenuChoice(text: string): 1 | 2 | 3 | 4 | 5 | 6 | null {
+  const m = text.trim().match(/^([1-6])\b/);
+  if (!m) return null;
+  return Number(m[1]) as any;
+}
+
+function parseYesNoChoiceFromNumbers(text: string): "yes" | "no" | null {
+  const s = text.trim();
+  if (/^1\b/.test(s)) return "yes";
+  if (/^2\b/.test(s)) return "no";
+  return null;
+}
+
+function parseTerm(text: string): number | null {
+  const s = text.trim();
+  // Direct terms
+  const m1 = s.match(/\b(6|12|18|24)\b/);
+  if (m1) return Number(m1[1]);
+  // Mapped menu options
+  const m2 = s.match(/^([1-4])\b/);
+  if (!m2) return null;
+  const map: Record<string, number> = { "1": 6, "2": 12, "3": 18, "4": 24 };
+  return map[m2[1]] ?? null;
+}
+
 function normalizeYesNo(text: string): "yes" | "no" | "maybe" | null {
   const s = text.toLowerCase();
   if (/(contado|efectivo|de contado|transferencia|cash)/.test(s)) return "no";
@@ -75,8 +117,12 @@ function parseChoice(text: string): 1 | 2 | 3 | null {
 function isStepAnswerForState(text: string, state: string | null | undefined) {
   const st = String(state ?? "");
   if (st === "AWAITING_CHOICE") return Boolean(parseChoice(text));
-  if (["AWAITING_FINANCE_INTEREST", "AWAITING_FINANCE", "AWAITING_TRADE_IN"].includes(st)) return Boolean(normalizeYesNo(text));
-  if (st === "AWAITING_TERM") return /\b(6|12|18|24)\b/.test(text);
+  if (st === "MENU") return Boolean(parseMenuChoice(text));
+  if (st === "AWAITING_FINANCE") return Boolean(parseYesNoChoiceFromNumbers(text) || normalizeYesNo(text));
+  if (st === "AWAITING_FINANCE_INTEREST") return Boolean(/^([1-4]|9)\b/.test(text) || normalizeYesNo(text));
+  if (st === "AWAITING_DP_MODE") return Boolean(/^([1-2]|9)\b/.test(text));
+  if (st === "AWAITING_TRADE_IN") return Boolean(parseYesNoChoiceFromNumbers(text) || normalizeYesNo(text));
+  if (st === "AWAITING_TERM") return Boolean(parseTerm(text));
   if (st === "AWAITING_DOWNPAYMENT") return Boolean(parseDownpayment(text).value);
   if (st === "AWAITING_USED_DETAILS") return text.trim().length > 0;
   return false;
@@ -483,114 +529,6 @@ export async function runBotForIncomingMessage({
     // ignore reset errors
   }
 
-
-  // Main menu shortcuts (WhatsApp interactive IDs or keywords).
-  const tRaw = incomingText.trim();
-  const tUpper = tRaw.toUpperCase();
-
-  const catalogUrl = process.env.CATALOG_URL ?? "https://jesusdiaz-automotores.vercel.app/catalogo";
-  const mapsUrl = process.env.MAPS_URL ?? "https://maps.app.goo.gl/6hwJZbMRK5oh3Evj9";
-
-  if (tUpper === "MENU_CATALOG" || /^menu\s*catalog/i.test(tRaw) || /\bcat[aá]logo\b/i.test(tRaw)) {
-    return {
-      decision: "menu_catalog",
-      replyText:
-        `Acá tenés el catálogo: ${catalogUrl}\n\nCuando veas uno que te guste, decime el modelo o pegá el link de la publicación.`,
-    };
-  }
-
-  if (tUpper === "MENU_LOCATION" || /\b(ubicaci[oó]n|horarios?|direcci[oó]n)\b/i.test(tRaw)) {
-    return {
-      decision: "menu_location",
-      replyText:
-        `Dirección: Piedrabuena 1578 esq Rauch\n` +
-        `Horarios: Lunes a viernes 8:30 a 12:30 y 16:00 a 20:00. Sábados 9:00 a 13:00\n` +
-        `Mapa: ${mapsUrl}`,
-    };
-  }
-
-  if (tUpper === "MENU_SEARCH" || /\b(buscar|otro auto|cambiar)\b/i.test(tRaw)) {
-    await supabase
-      .from("leads")
-      .update({
-        conversation_state: "AWAITING_CAR",
-        car_query: null,
-        last_vehicle_suggestions: null,
-        selected_vehicle: null,
-        selected_vehicle_id: null,
-      })
-      .eq("id", lead0.id);
-
-    return {
-      decision: "menu_search",
-      replyText: "Perfecto. ¿Qué modelo/segmento buscás? (decime 1 o 2 modelos)",
-    };
-  }
-
-  if (tUpper === "MENU_TRADEIN" || /\b(permuta|usado|tasa|tasar)\b/i.test(tRaw)) {
-    await supabase.from("leads").update({ conversation_state: "AWAITING_USED_DETAILS" }).eq("id", lead0.id);
-    return {
-      decision: "menu_tradein",
-      replyText: "Dale. Pasame lo que tengas de tu usado: marca/modelo, año, km y estado (excelente/bien/detalles).",
-    };
-  }
-
-  if (tUpper === "MENU_FINANCE" || /\b(cuotas?|financi)\b/i.test(tRaw)) {
-    // If we have a selected vehicle, jump to term selection using the minimum delivery rule (60/40).
-    const sv: any = lead0.selected_vehicle ?? null;
-    const price = Number(sv?.price_ars ?? sv?.price ?? sv?.priceARS ?? 0) || 0;
-
-    if (!sv || !price) {
-      return {
-        decision: "menu_finance_need_vehicle",
-        replyText:
-          "Para simular cuotas necesito una unidad. Podés abrir el catálogo o decirme qué modelo te interesa y tu presupuesto, y te paso opciones.",
-      };
-    }
-
-    // Set default delivery 60% and go straight to term.
-    await supabase
-      .from("leads")
-      .update({
-        finance: "yes",
-        selected_vehicle: { ...sv, finance_downpayment: { value: 60, isPercent: true, currency: "ARS" } },
-        conversation_state: "AWAITING_TERM",
-      })
-      .eq("id", lead0.id);
-
-    const entrega = Math.round(price * 0.6);
-    const financia = Math.round(price * 0.4);
-
-    return {
-      decision: "menu_finance_start",
-      replyText:
-        `Para darte un ejemplo: entrega mínima 60% ($ ${entrega.toLocaleString("es-AR")}) y financiás 40% ($ ${financia.toLocaleString("es-AR")}).\n` +
-        `¿En cuántas cuotas te gustaría? (6/12/18/24)\n` +
-        `Si querés ajustar la entrega, escribime el monto o porcentaje (ej: $9.000.000 o 70%).`,
-    };
-  }
-
-  if (tUpper === "MENU_ADVISOR" || hasAdvisorKeyword(incomingText)) {
-    // If already handed off, just acknowledge.
-    if (lead0.assigned_agent_id) {
-      await supabase.from("leads").update({ conversation_state: "HANDED_OFF", stage: "handed_off" }).eq("id", lead0.id);
-      await saveBotRun(supabase, lead0.id, "handoff_keyword_already_assigned");
-      return { decision: "handoff_keyword_already_assigned", replyText: "Al momento te contacta un asesor." };
-    }
-
-    const agent = await pickNextAgent(supabase);
-    await supabase
-      .from("leads")
-      .update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id })
-      .eq("id", lead0.id);
-
-    await tryMarkHandedOff(supabase, lead0.id);
-    await notifyAgentOutbox(supabase, agent, lead0, incomingText);
-    await saveBotRun(supabase, lead0.id, "handoff_keyword_assigned", { agent_id: agent.id });
-
-    return { decision: "handoff_ready", replyText: "Al momento te contacta un asesor." };
-  }
-
   // Courtesy/ack messages: do not push the flow.
   if (looksLikeThanksOrAck(incomingText)) {
     const base = "¡De nada!";
@@ -598,6 +536,72 @@ export async function runBotForIncomingMessage({
       ? " Mientras tanto, si querés puedo pasarte más fotos, detalles o un aproximado de cuotas."
       : " Si querés, decime qué modelo buscás o tu presupuesto y te paso opciones.";
     return { decision: "courtesy_ack", replyText: `${base}${extra}` };
+  }
+
+  // Global: user asks for menu / wants to restart options.
+  if (isMenuKeyword(incomingText)) {
+    await supabase.from("leads").update({ conversation_state: "MENU" }).eq("id", lead0.id);
+    return { decision: "show_menu", replyText: mainMenuText() };
+  }
+
+  // Handle menu selection.
+  if (String(lead0.conversation_state) === "MENU") {
+    const c = parseMenuChoice(incomingText);
+    if (!c) return { decision: "menu_retry", replyText: `${mainMenuText()}\n\n(Respondé 1 a 6)` };
+
+    if (c === 1) {
+      await supabase.from("leads").update({ conversation_state: "START" }).eq("id", lead0.id);
+      return {
+        decision: "menu_catalog",
+        replyText:
+          "Catálogo: https://jesusdiaz-automotores.vercel.app/catalogo\n\nCuando veas uno que te guste, decime el modelo (o pegá el link de la publicación).\n\n9) Menú",
+      };
+    }
+    if (c === 2) {
+      await supabase.from("leads").update({ conversation_state: "AWAITING_CAR" }).eq("id", lead0.id);
+      return { decision: "menu_search_model", replyText: "Decime 1 o 2 modelos que te interesen.\n\n9) Menú" };
+    }
+    if (c === 3) {
+      // If we have a selected unit, start simulation. Otherwise, guide to pick one.
+      if (lead0.selected_vehicle) {
+        await supabase.from("leads").update({ finance: "yes", conversation_state: "AWAITING_DP_MODE" }).eq("id", lead0.id);
+        return {
+          decision: "menu_simulate_start",
+          replyText:
+            "Para simular cuotas, elegí una opción:\n1) Entrega mínima 60% (recomendado)\n2) Voy a decir mi entrega ($ o %)\n\n9) Menú",
+        };
+      }
+      await supabase.from("leads").update({ conversation_state: "START" }).eq("id", lead0.id);
+      return {
+        decision: "menu_simulate_need_unit",
+        replyText:
+          "Para simular cuotas necesito una unidad elegida.\n\n1) Ver catálogo\n2) Buscar por modelo\n\n9) Menú",
+      };
+    }
+    if (c === 4) {
+      // Valuation / trade-in entry (no required fields)
+      await supabase
+        .from("leads")
+        .update({ intent: "sell", conversation_state: "AWAITING_USED_DETAILS" })
+        .eq("id", lead0.id);
+      return {
+        decision: "menu_tradein",
+        replyText:
+          "Dale. Para tasar tu usado mandame lo que tengas: Marca/Modelo, Año, Km y estado (excelente/bien/detalles).\nEj: \"Gol 2016 120.000 km bien\".\n\n1) No tengo datos ahora\n2) Hablar con asesor\n\n9) Menú",
+      };
+    }
+    if (c === 5) {
+      // fall through to the existing keyword handoff path
+      incomingText = "hablar con asesor";
+    }
+    if (c === 6) {
+      await supabase.from("leads").update({ conversation_state: "START" }).eq("id", lead0.id);
+      return {
+        decision: "menu_location",
+        replyText:
+          "Dirección: Piedrabuena 1578 esq Rauch\nHorarios: Lunes a viernes 8:30 a 12:30 y 16:00 a 20:00. Sábados 9:00 a 13:00\nMapa: https://maps.app.goo.gl/6hwJZbMRK5oh3Evj9\n\n9) Menú",
+      };
+    }
   }
 
   // When the lead is already handed off, a bare "no" should not trigger a new search/options.
@@ -608,7 +612,7 @@ export async function runBotForIncomingMessage({
       return {
         decision: "handed_off_no_ack",
         replyText:
-          "Perfecto. ¿Querés coordinar para verla, ver otra unidad, o te armo un aproximado de cuotas?",
+          "Listo. ¿Qué querés hacer ahora?\n1) Ver catálogo\n2) Ubicación / horarios\n3) Hablar con asesor\n\n9) Menú",
       };
     }
   }
@@ -619,7 +623,7 @@ export async function runBotForIncomingMessage({
     if (lead0.assigned_agent_id) {
       await supabase.from("leads").update({ conversation_state: "HANDED_OFF", stage: "handed_off" }).eq("id", lead0.id);
       await saveBotRun(supabase, lead0.id, "handoff_keyword_already_assigned");
-      return { decision: "handoff_keyword_already_assigned", replyText: "Al momento te contacta un asesor." };
+      return { decision: "handoff_keyword_already_assigned", replyText: "Al momento te contacta un asesor.\n\n9) Menú" };
     }
 
     const agent = await pickNextAgent(supabase);
@@ -633,7 +637,7 @@ export async function runBotForIncomingMessage({
     await notifyAgentOutbox(supabase, agent, lead0, incomingText);
     await saveBotRun(supabase, lead0.id, "handoff_keyword");
 
-    return { decision: "handoff_keyword", replyText: "Al momento te contacta un asesor." };
+    return { decision: "handoff_keyword", replyText: "Al momento te contacta un asesor.\n\n9) Menú" };
   }
 
   // If the user changes the topic/model mid-flow, reset the conversational state so the bot doesn't
@@ -696,12 +700,20 @@ export async function runBotForIncomingMessage({
       const first4 = pics.slice(0, 4);
 
       const outgoing: NonNullable<BotResult["outgoing"]> = [{ type: "text", body: `${card}\n\nTe paso 4 fotos 👇` }];
-      for (const link of first4) outgoing.push({ type: "image", link });
-      outgoing.push({
-        type: "text",
-        body:
-          "Si querés, te hago un aproximado de cuotas (sin compromiso) para que te des una idea. ¿Te lo armo? (sí/no)\n\nSi querés más fotos, escribí: más fotos.",
-      });
+      const actionCaption =
+        "¿Qué querés hacer ahora? Respondé con un número:\n" +
+        "1) Simular cuotas\n" +
+        "2) Link de la publicación\n" +
+        "3) Más fotos\n" +
+        "4) Hablar con asesor\n\n" +
+        "9) Menú";
+
+      // Send first 3 images without caption, last image with the options caption (so it appears at the end).
+      for (let i = 0; i < first4.length; i++) {
+        const link = first4[i];
+        if (i === first4.length - 1) outgoing.push({ type: "image", link, caption: actionCaption });
+        else outgoing.push({ type: "image", link });
+      }
 
       return { decision: "vehicle_card_and_photos", outgoing };
     }
@@ -730,18 +742,28 @@ export async function runBotForIncomingMessage({
   // Used vehicle details flow (sell/trade)
   if (lead0.conversation_state === "AWAITING_USED_DETAILS") {
     const usedText = incomingText.trim();
-    if (usedText.length < 3) {
+    const quick = usedText.match(/^([1-2])\b/)?.[1] ?? null;
+
+    // 1) No tengo datos ahora -> skip details
+    // 2) Hablar con asesor -> handoff now
+    const shouldSkipDetails = quick === "1";
+    const forcedHandoff = quick === "2";
+
+    if (!shouldSkipDetails && !forcedHandoff && usedText.length < 3) {
       return {
         decision: "used_details_retry",
-        replyText: "¿Me decís marca, modelo, año y km de tu usado? (ej: Suran 2013, 126.000 km)",
+        replyText:
+          "Mandame lo que tengas de tu usado (texto). Ej: \"Gol 2016 120.000 km bien\".\n\n1) No tengo datos ahora\n2) Hablar con asesor\n\n9) Menú",
       };
     }
 
     // Save (best-effort; column may not exist yet)
-    try {
-      await supabase.from("leads").update({ used_vehicle_text: usedText }).eq("id", lead0.id);
-    } catch {
-      // ignore
+    if (!shouldSkipDetails && !forcedHandoff) {
+      try {
+        await supabase.from("leads").update({ used_vehicle_text: usedText }).eq("id", lead0.id);
+      } catch {
+        // ignore
+      }
     }
 
     const intent = String(lead0.intent ?? "").toLowerCase();
@@ -754,7 +776,7 @@ export async function runBotForIncomingMessage({
       };
     }
 
-    // SELL: handoff to an agent for valuation.
+    // SELL (or BUY+trade-in): handoff to an agent for valuation.
     if (lead0.assigned_agent_id) {
       const { data: agent } = await supabase.from("agents").select("*").eq("id", lead0.assigned_agent_id).maybeSingle();
       if (agent) await notifyAgentOutbox(supabase, agent, lead0, incomingText, { used_vehicle_text: usedText });
@@ -762,7 +784,7 @@ export async function runBotForIncomingMessage({
       await tryMarkHandedOff(supabase, lead0.id);
       return {
         decision: "used_details_saved_already_assigned",
-        replyText: "Listo, lo dejo asentado. Al momento te contacta un asesor.",
+        replyText: "Al momento te contacta un asesor.\n\n9) Menú",
       };
     }
 
@@ -772,32 +794,96 @@ export async function runBotForIncomingMessage({
     await notifyAgentOutbox(supabase, agent, lead0, incomingText, { used_vehicle_text: usedText });
     return {
       decision: "used_details_saved_handoff",
-      replyText: "Al momento te contacta un asesor.",
+      replyText: "Al momento te contacta un asesor.\n\n9) Menú",
     };
   }
 
   // Financing-approx flow after showing a vehicle.
   if (lead0.conversation_state === "AWAITING_FINANCE_INTEREST") {
-    const ans = normalizeYesNo(incomingText);
-    if (ans === "yes") {
-      await supabase.from("leads").update({ finance: "yes", conversation_state: "AWAITING_DOWNPAYMENT" }).eq("id", lead0.id);
+    const action = Number(incomingText.trim().match(/^([1-4])\b/)?.[1] ?? NaN);
+
+    // Backward compatibility: if they type "sí", treat it as "simular cuotas".
+    const legacy = normalizeYesNo(incomingText);
+
+    if (action === 3 || wantsMorePhotos(incomingText)) {
+      // Reuse the existing photos handler.
+      const sv = lead0.selected_vehicle as VehicleSuggestion | null;
+      if (sv) {
+        const pics = Array.isArray((sv as any).pictures) ? (sv as any).pictures.filter(Boolean) : [];
+        const outgoing: NonNullable<BotResult["outgoing"]> = [{ type: "text", body: "Dale, te paso más fotos 👇" }];
+        for (const link of pics) outgoing.push({ type: "image", link });
+        return { decision: "more_photos_from_actions", outgoing };
+      }
+    }
+
+    if (action === 2 || wantsPublicationLink(incomingText)) {
+      const sv = lead0.selected_vehicle as any;
+      if (sv?.permalink) {
+        return { decision: "share_publication_link_from_actions", replyText: `Acá tenés la publicación: ${sv.permalink}\n\n9) Menú` };
+      }
+      return { decision: "no_publication_link", replyText: "Todavía no tengo link público cargado de esa unidad.\n\n9) Menú" };
+    }
+
+    if (action === 4) {
+      // Handoff (same behavior as keyword)
+      if (lead0.assigned_agent_id) {
+        await supabase.from("leads").update({ conversation_state: "HANDED_OFF", stage: "handed_off" }).eq("id", lead0.id);
+        await saveBotRun(supabase, lead0.id, "handoff_from_vehicle_actions_already_assigned");
+        return { decision: "handoff_from_vehicle_actions_already_assigned", replyText: "Al momento te contacta un asesor.\n\n9) Menú" };
+      }
+
+      const agent = await pickNextAgent(supabase);
+      await supabase
+        .from("leads")
+        .update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id })
+        .eq("id", lead0.id);
+      await tryMarkHandedOff(supabase, lead0.id);
+      await notifyAgentOutbox(supabase, agent, lead0, incomingText);
+      await saveBotRun(supabase, lead0.id, "handoff_from_vehicle_actions");
+      return { decision: "handoff_from_vehicle_actions", replyText: "Al momento te contacta un asesor.\n\n9) Menú" };
+    }
+
+    if (action === 1 || legacy === "yes") {
+      await supabase.from("leads").update({ finance: "yes", conversation_state: "AWAITING_DP_MODE" }).eq("id", lead0.id);
       return {
-        decision: "ask_downpayment",
-        replyText: "Dale. ¿Cuánto pensás entregar de anticipo aprox? (en $ o %)",
+        decision: "ask_dp_mode",
+        replyText: "Para simular cuotas, elegí una opción:\n1) Entrega mínima 60% (recomendado)\n2) Voy a decir mi entrega ($ o %)\n\n9) Menú",
       };
     }
-    if (ans === "no") {
-      await supabase.from("leads").update({ finance: "no", conversation_state: "AWAITING_TRADE_IN" }).eq("id", lead0.id);
-      return { decision: "skip_financing", replyText: "Perfecto. ¿Tenés usado para permuta?" };
-    }
     // If they ask a question about the unit, let extraction handle it below.
+  }
+
+  if (lead0.conversation_state === "AWAITING_DP_MODE" && lead0.selected_vehicle) {
+    const s = incomingText.trim();
+    if (/^1\b/.test(s)) {
+      const sv = lead0.selected_vehicle as any;
+      const dp = { value: 60, isPercent: true, currency: "ARS" as const };
+      await supabase
+        .from("leads")
+        .update({ selected_vehicle: { ...sv, finance_downpayment: dp }, conversation_state: "AWAITING_TERM" })
+        .eq("id", lead0.id);
+      return {
+        decision: "dp_min_60_set",
+        replyText: "Perfecto. ¿En cuántas cuotas?\n1) 6\n2) 12\n3) 18\n4) 24\n\n9) Menú",
+      };
+    }
+    if (/^2\b/.test(s)) {
+      await supabase.from("leads").update({ conversation_state: "AWAITING_DOWNPAYMENT" }).eq("id", lead0.id);
+      return {
+        decision: "ask_downpayment",
+        replyText: "Dale. ¿Cuánto pensás entregar de anticipo aprox? (podés poner $ o %)\n\n9) Menú",
+      };
+    }
   }
 
   if (lead0.conversation_state === "AWAITING_DOWNPAYMENT" && lead0.selected_vehicle) {
     const sv = lead0.selected_vehicle as any;
     const parsed = parseDownpayment(incomingText);
     if (!parsed.value) {
-      return { decision: "downpayment_retry", replyText: "¿Cuánto podrías entregar aprox? (por ejemplo: 30% o $5.000.000)" };
+      return {
+        decision: "downpayment_retry",
+        replyText: "¿Cuánto podrías entregar aprox? (por ejemplo: 30% o $5.000.000)\n\n9) Menú",
+      };
     }
     await supabase
       .from("leads")
@@ -806,13 +892,13 @@ export async function runBotForIncomingMessage({
         conversation_state: "AWAITING_TERM",
       })
       .eq("id", lead0.id);
-    return { decision: "ask_term", replyText: "¿En cuántas cuotas te gustaría? (6/12/18/24)" };
+    return { decision: "ask_term", replyText: "¿En cuántas cuotas?\n1) 6\n2) 12\n3) 18\n4) 24\n\n9) Menú" };
   }
 
   if (lead0.conversation_state === "AWAITING_TERM" && lead0.selected_vehicle) {
-    const term = Number(String(incomingText).trim().match(/\b(6|12|18|24)\b/)?.[1] ?? NaN);
-    if (!Number.isFinite(term)) {
-      return { decision: "term_retry", replyText: "¿En cuántas cuotas? (6/12/18/24)" };
+    const term = parseTerm(incomingText);
+    if (!term) {
+      return { decision: "term_retry", replyText: "¿En cuántas cuotas?\n1) 6\n2) 12\n3) 18\n4) 24\n\n9) Menú" };
     }
 
     const sv = lead0.selected_vehicle as any;
@@ -824,6 +910,12 @@ export async function runBotForIncomingMessage({
       if (dp.isPercent) downARS = Math.round((sv.price_ars * dp.value) / 100);
       else downARS = moneyToARS(dp.value, dp.currency ?? "ARS", blueSell);
     }
+
+    // Business rule: minimum delivery 60% (max finance 40%).
+    const minDown = Math.round(Number(sv.price_ars) * 0.6);
+    const wasAdjusted = downARS < minDown;
+    if (wasAdjusted) downARS = minDown;
+
     const montoFinanciado = Math.max(0, Math.round(Number(sv.price_ars) - downARS));
     const quote = montoFinanciado > 0 ? await getCreditCarQuote({ montoARS: montoFinanciado, modeloYear: sv.year ?? undefined, term }) : null;
     const cuotaCreditCar = quote?.selected?.cuota ?? null;
@@ -837,83 +929,110 @@ Cuotas (CreditCar):
 Simulación aprox.:
 ${quote.summaryText}` : "");
 
+    const adjustLine = wasAdjusted
+      ? `\n\n(Para esta simulación se tomó entrega mínima 60%: $ ${minDown.toLocaleString("es-AR")})`
+      : "";
+
     await supabase
       .from("leads")
       .update({ selected_vehicle: { ...sv, finance_term: term, finance_amount_ars: montoFinanciado }, conversation_state: "AWAITING_TRADE_IN" })
       .eq("id", lead0.id);
 
-    return { decision: "quote_done_ask_tradein", replyText: `Listo.${cuotaLine}
-
-¿Tenés usado para permuta?` };
+    return {
+      decision: "quote_done_ask_tradein",
+      replyText: `Listo.${cuotaLine}${adjustLine}\n\n¿Tenés usado para permuta?\n1) Sí\n2) No\n\n9) Menú`,
+    };
   }
 
   // Finance fast-path when we are awaiting it
   if (lead0.conversation_state === "AWAITING_FINANCE") {
-    const f = normalizeYesNo(incomingText);
-    if (f) {
-      await supabase.from("leads").update({ finance: f, conversation_state: "AWAITING_TRADE_IN" }).eq("id", lead0.id);
-      await saveBotRun(supabase, lead0.id, "finance_set", { finance: f });
-
-      if (f === "yes" && lead0.selected_vehicle) {
-        const sv = lead0.selected_vehicle as VehicleSuggestion;
-        const quote = await getCreditCarQuote({
-          montoARS: (sv as any).finance_amount_ars ?? (sv as any).price_ars,
-          modeloYear: (sv as any).year ?? undefined,
-          term: (sv as any).finance_term ?? undefined,
-        });
-        // Ask next question only
-        const cuotaCreditCar = quote?.selected?.cuota ?? null;
-        const quoteLine = cuotaCreditCar
-          ? `
-
-Cuotas (CreditCar): $ ${Math.round(cuotaCreditCar).toLocaleString("es-AR")}`
-          : (quote?.summaryText ? `
-
-Simulación aprox.: ${quote.summaryText}` : "");
-        return { decision: "ask_tradein_with_quote", replyText: `Perfecto.${quoteLine}\n\n¿Tenés usado para permuta?` };
-      }
-
-      return { decision: "ask_tradein", replyText: "¿Tenés usado para permuta?" };
+    const f = parseYesNoChoiceFromNumbers(incomingText) || normalizeYesNo(incomingText);
+    if (!f) {
+      return { decision: "finance_retry", replyText: "¿Cómo sería la compra?\n1) Con financiación (cuotas)\n2) Contado\n\n9) Menú" };
     }
+
+    await supabase.from("leads").update({ finance: f }).eq("id", lead0.id);
+    await saveBotRun(supabase, lead0.id, "finance_set", { finance: f });
+
+    if (f === "yes") {
+      // If there is a selected unit, go straight to simulation. Otherwise guide.
+      if (lead0.selected_vehicle) {
+        await supabase.from("leads").update({ conversation_state: "AWAITING_DP_MODE" }).eq("id", lead0.id);
+        return {
+          decision: "finance_yes_start_sim",
+          replyText: "Para simular cuotas, elegí una opción:\n1) Entrega mínima 60% (recomendado)\n2) Voy a decir mi entrega ($ o %)\n\n9) Menú",
+        };
+      }
+      await supabase.from("leads").update({ conversation_state: "START" }).eq("id", lead0.id);
+      return {
+        decision: "finance_yes_need_unit",
+        replyText: "Perfecto. Para simular cuotas necesito una unidad elegida.\n\n1) Ver catálogo\n2) Buscar por modelo\n\n9) Menú",
+      };
+    }
+
+    // Contado
+    await supabase.from("leads").update({ conversation_state: "AWAITING_TRADE_IN" }).eq("id", lead0.id);
+    return { decision: "ask_tradein", replyText: "¿Tenés usado para permuta?\n1) Sí\n2) No\n\n9) Menú" };
   }
 
   // Trade-in fast-path when we are awaiting it
   if (lead0.conversation_state === "AWAITING_TRADE_IN") {
-    const t = normalizeYesNo(incomingText);
-    if (t) {
-      const { data: updated } = await supabase
-        .from("leads")
-        .update({ trade_in: t })
-        .eq("id", lead0.id)
-        .select("*")
-        .single();
-
-      await saveBotRun(supabase, lead0.id, "trade_in_set", { trade_in: t });
-
-      // If the lead already has an assigned agent, avoid re-handing off. Just log/notify and keep helping.
-      if (lead0.assigned_agent_id) {
-        const { data: agent } = await supabase.from("agents").select("*").eq("id", lead0.assigned_agent_id).maybeSingle();
-        if (agent) {
-          await notifyAgentOutbox(supabase, agent, updated ?? lead0, incomingText, { trade_in: t });
-        }
-        await supabase.from("leads").update({ conversation_state: "HANDED_OFF", stage: "handed_off" }).eq("id", lead0.id);
-        await tryMarkHandedOff(supabase, lead0.id);
-        return { decision: "tradein_added_already_handed_off", replyText: "Dale, lo sumo y el asesor lo tiene en cuenta. ¿Querés que te pase el link de la publicación o más fotos?" };
-      }
-
-      const agent = await pickNextAgent(supabase);
-      await supabase.from("leads").update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id }).eq("id", lead0.id);
-
-      await tryMarkHandedOff(supabase, lead0.id);
-      await notifyAgentOutbox(supabase, agent, updated ?? lead0, incomingText);
-      return { decision: "handoff_ready", replyText: "Al momento te contacta un asesor." };
+    const t = parseYesNoChoiceFromNumbers(incomingText) || normalizeYesNo(incomingText);
+    if (!t) {
+      return { decision: "tradein_retry", replyText: "¿Tenés usado para permuta?\n1) Sí\n2) No\n\n9) Menú" };
     }
+
+    const { data: updated } = await supabase
+      .from("leads")
+      .update({ trade_in: t })
+      .eq("id", lead0.id)
+      .select("*")
+      .single();
+
+    await saveBotRun(supabase, lead0.id, "trade_in_set", { trade_in: t });
+
+    if (t === "yes") {
+      await supabase.from("leads").update({ conversation_state: "AWAITING_USED_DETAILS" }).eq("id", lead0.id);
+      return {
+        decision: "tradein_yes_ask_details",
+        replyText:
+          "Perfecto. Para tasarlo mandame lo que tengas: Marca/Modelo, Año, Km y estado (excelente/bien/detalles).\nEj: \"Gol 2016 120.000 km bien\".\n\n1) No tengo datos ahora\n2) Hablar con asesor\n\n9) Menú",
+      };
+    }
+
+    // No trade-in: go to advisor handoff.
+    if (lead0.assigned_agent_id) {
+      const { data: agent } = await supabase.from("agents").select("*").eq("id", lead0.assigned_agent_id).maybeSingle();
+      if (agent) {
+        await notifyAgentOutbox(supabase, agent, updated ?? lead0, incomingText, { trade_in: t });
+      }
+      await supabase.from("leads").update({ conversation_state: "HANDED_OFF", stage: "handed_off" }).eq("id", lead0.id);
+      await tryMarkHandedOff(supabase, lead0.id);
+      return {
+        decision: "tradein_no_already_handed_off",
+        replyText: "Al momento te contacta un asesor.\n\nSi querés: escribí 'link' / 'más fotos' / 'ubicación'.\n\n9) Menú",
+      };
+    }
+
+    const agent = await pickNextAgent(supabase);
+    await supabase
+      .from("leads")
+      .update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id })
+      .eq("id", lead0.id);
+
+    await tryMarkHandedOff(supabase, lead0.id);
+    await notifyAgentOutbox(supabase, agent, updated ?? lead0, incomingText);
+    return {
+      decision: "tradein_no_handoff",
+      replyText: "Al momento te contacta un asesor.\n\nSi querés: escribí 'link' / 'más fotos' / 'ubicación'.\n\n9) Menú",
+    };
   }
 
   if (looksLikeGreetingOnly(incomingText)) {
+    await supabase.from("leads").update({ conversation_state: "MENU" }).eq("id", lead0.id);
     return {
       decision: "greeting",
-      replyText: "¡Hola! Soy el asistente de Jesús Díaz Automotores. ¿Buscás comprar o entregar tu usado en parte de pago?",
+      replyText: `¡Hola! Soy el asistente de Jesús Díaz Automotores.\n\n${mainMenuText()}`,
     };
   }
 
@@ -1005,11 +1124,15 @@ Simulación aprox.: ${quote.summaryText}` : "");
 
   if (missing.includes("finance")) {
     await supabase.from("leads").update({ conversation_state: "AWAITING_FINANCE" }).eq("id", lead0.id);
-    return { decision: "ask_finance", replyText: "¿Lo querés financiar o sería contado?", extracted };
+    return {
+      decision: "ask_finance",
+      replyText: "¿Cómo sería la compra?\n1) Con financiación (cuotas)\n2) Contado\n\n9) Menú",
+      extracted,
+    };
   }
   if (missing.includes("trade_in")) {
     await supabase.from("leads").update({ conversation_state: "AWAITING_TRADE_IN" }).eq("id", lead0.id);
-    return { decision: "ask_tradein", replyText: "¿Tenés usado para permuta?", extracted };
+    return { decision: "ask_tradein", replyText: "¿Tenés usado para permuta?\n1) Sí\n2) No\n\n9) Menú", extracted };
   }
 
   // Ready to handoff
@@ -1017,7 +1140,7 @@ Simulación aprox.: ${quote.summaryText}` : "");
   if (alreadyAssigned) {
     return {
       decision: "already_handed_off_continue",
-      replyText: "Al momento te contacta un asesor.",
+      replyText: "Al momento te contacta un asesor.\n\nSi querés: escribí 'link' / 'más fotos' / 'ubicación'.\n\n9) Menú",
       extracted,
     };
   }
@@ -1029,7 +1152,7 @@ Simulación aprox.: ${quote.summaryText}` : "");
 
   return {
     decision: "handoff_ready",
-    replyText: "Al momento te contacta un asesor.",
+    replyText: "Al momento te contacta un asesor.\n\nSi querés: escribí 'link' / 'más fotos' / 'ubicación'.\n\n9) Menú",
     extracted,
   };
 }

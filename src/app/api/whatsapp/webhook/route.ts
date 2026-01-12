@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import crypto from "crypto";
 import { createAdminClient } from "@/lib/supabaseAdmin";
-import { sendWhatsAppText, sendWhatsAppImage, sendMainMenu } from "@/lib/whatsapp";
+import { sendWhatsAppText, sendWhatsAppImage } from "@/lib/whatsapp";
 import { runBotForIncomingMessage } from "@/lib/bot/runBot";
 
 export const runtime = "nodejs";
@@ -54,25 +54,6 @@ function verifySignature(rawBody: string, signatureHeader: string | null) {
   }
 }
 
-function extractIncomingText(msg: any): string {
-  // WhatsApp Cloud can send: text, interactive (list/button), or other types.
-  if (!msg) return "";
-  const type = String(msg.type ?? "");
-
-  if (type === "text") return msg.text?.body ?? "";
-
-  if (type === "interactive") {
-    const i = msg.interactive;
-    const id = i?.list_reply?.id ?? i?.button_reply?.id;
-    const title = i?.list_reply?.title ?? i?.button_reply?.title;
-    return String(id ?? title ?? "");
-  }
-
-  // Fallbacks for other message types
-  if (msg.button?.text) return String(msg.button.text);
-  return "";
-}
-
 // GET: verificación webhook
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
@@ -108,7 +89,7 @@ export async function POST(req: Request) {
   const msg = messages[0];
   const waMessageId = msg.id as string | undefined;
   const from = msg.from as string; // "549..." (sin '+')
-  const text = extractIncomingText(msg) ?? "";
+  const text = msg.text?.body ?? "";
 
   const phoneE164 = from?.startsWith("+") ? from : `+${from}`;
   const name = contacts?.[0]?.profile?.name as string | undefined;
@@ -219,21 +200,6 @@ export async function POST(req: Request) {
         extracted: result?.extracted ?? null,
       });
     }
-  }
-
-
-  // Always send the main menu after handling the message (user requested: menú siempre).
-  try {
-    await sendMainMenu(phoneE164);
-    await supabase.from("messages").insert({
-      lead_id: lead.id,
-      direction: "out",
-      text: "[[menu]]",
-      raw_payload: { type: "menu" },
-    });
-    await supabase.from("leads").update({ last_bot_message_at: new Date().toISOString() }).eq("id", lead.id);
-  } catch {
-    // ignore menu send errors
   }
 
   return NextResponse.json({ ok: true }, { status: 200 });

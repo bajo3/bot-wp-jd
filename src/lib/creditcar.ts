@@ -16,8 +16,38 @@ export type CreditCarQuote = {
 function parseNumberLoose(v: any): number | null {
   if (v === null || v === undefined) return null;
   if (typeof v === "number" && Number.isFinite(v)) return v;
-  const s = String(v).replace(/\./g, "").replace(/,/g, ".").trim(); // handles 521400.00 or 521.400,00
-  const n = Number(s);
+
+  // Flexible parser that avoids the classic x100 bug:
+  // - "521400.00" -> 521400 (dot as decimal)
+  // - "521.400" -> 521400 (dot as thousands)
+  // - "521.400,00" -> 521400 (AR style)
+  // - "521400,00" -> 521400
+  const raw = String(v).trim();
+  if (!raw) return null;
+
+  const hasDot = raw.includes(".");
+  const hasComma = raw.includes(",");
+
+  let normalized = raw;
+
+  if (hasDot && hasComma) {
+    // Assume dot thousands, comma decimal (es-AR)
+    normalized = raw.replace(/\./g, "").replace(/,/g, ".");
+  } else if (hasComma && !hasDot) {
+    // Assume comma decimal
+    normalized = raw.replace(/,/g, ".");
+  } else if (hasDot && !hasComma) {
+    // Dot could be decimal or thousands. If exactly 1 dot and <=2 decimals, treat as decimal.
+    const parts = raw.split(".");
+    const last = parts[parts.length - 1] ?? "";
+    const looksLikeDecimal = parts.length === 2 && /^\d{1,2}$/.test(last);
+    if (looksLikeDecimal) normalized = raw;
+    else normalized = raw.replace(/\./g, "");
+  }
+
+  // Strip spaces and currency symbols
+  normalized = normalized.replace(/[^0-9.\-]/g, "");
+  const n = Number(normalized);
   return Number.isFinite(n) ? n : null;
 }
 
@@ -92,7 +122,8 @@ function summarize(raw: any): string {
         const tasa = o?.tna ?? o?.tea ?? o?.tasa ?? null;
         const parts = [];
         if (plazo) parts.push(`${plazo} cuotas`);
-        if (cuota) parts.push(`cuota aprox. ${Number(cuota).toLocaleString("es-AR")}`);
+        const cuotaN = parseNumberLoose(cuota);
+        if (cuotaN) parts.push(`cuota aprox. ${Math.round(cuotaN).toLocaleString("es-AR")}`);
         if (tasa) parts.push(`tasa ${tasa}`);
         return `• Opción ${i + 1}: ${parts.filter(Boolean).join(" — ")}`.trim();
       })
@@ -106,7 +137,8 @@ function summarize(raw: any): string {
   if (cuota || plazo) {
     const parts = [];
     if (plazo) parts.push(`${plazo} cuotas`);
-    if (cuota) parts.push(`cuota aprox. ${Number(cuota).toLocaleString("es-AR")}`);
+    const cuotaN = parseNumberLoose(cuota);
+    if (cuotaN) parts.push(`cuota aprox. ${Math.round(cuotaN).toLocaleString("es-AR")}`);
     return parts.join(" — ");
   }
 
@@ -126,7 +158,7 @@ function summarize(raw: any): string {
 
 export async function getCreditCarQuote(params: { montoARS: number; modeloYear?: number; term?: number }): Promise<CreditCarQuote | null> {
   const { montoARS } = params;
-  const modeloYear = params.modeloYear ?? new Date().getFullYear();
+  const modeloYear = Math.max(2012, Number(params.modeloYear ?? new Date().getFullYear()) || 2012);
   const term = params.term;
 
   const url = `https://api.cotizadorcreditcar.com.ar/2?monto=${encodeURIComponent(String(montoARS))}&modelo=${encodeURIComponent(
