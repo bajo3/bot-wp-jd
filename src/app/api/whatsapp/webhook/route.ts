@@ -52,25 +52,25 @@ function verifySignature(rawBody: string, signatureHeader: string | null) {
   } catch {
     return false;
   }
+}
 
 function extractIncomingText(msg: any): string {
   // WhatsApp Cloud can send: text, interactive (list/button), or other types.
   if (!msg) return "";
   const type = String(msg.type ?? "");
+
   if (type === "text") return msg.text?.body ?? "";
 
   if (type === "interactive") {
     const i = msg.interactive;
     const id = i?.list_reply?.id ?? i?.button_reply?.id;
     const title = i?.list_reply?.title ?? i?.button_reply?.title;
-    return id ?? title ?? "";
+    return String(id ?? title ?? "");
   }
 
   // Fallbacks for other message types
   if (msg.button?.text) return String(msg.button.text);
   return "";
-}
-
 }
 
 // GET: verificación webhook
