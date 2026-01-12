@@ -13,6 +13,7 @@
 import { searchVehiclesClosest, formatVehicleOptions, type VehicleSuggestion } from "@/lib/vehicleSearch";
 import { getCreditCarQuote } from "@/lib/creditcar";
 import { getBlueSellRate, moneyToARS } from "@/lib/exchangeRate";
+import { sendWhatsAppText } from "@/lib/whatsapp";
 
 type LeadRow = any;
 
@@ -55,6 +56,26 @@ function hasAdvisorKeyword(t: string) {
   const s = t.toLowerCase();
   return s.includes("hablar con asesor") || s.includes("asesor") || s.includes("vendedor") || s.includes("humano");
 }
+
+function wantsCatalogQuick(t: string) {
+  const s = t.toLowerCase();
+  return (
+    s.includes("catálogo") ||
+    s.includes("catalogo") ||
+    s.includes("stock") ||
+    s.includes("unidades") ||
+    s.includes("ver autos") ||
+    s.includes("ver opciones") ||
+    s.includes("opciones") ||
+    s.includes("modelos") ||
+    s.includes("que tenes") ||
+    s.includes("qué tenés") ||
+    s.includes("qué tenes") ||
+    s.includes("tenés") ||
+    s.includes("tienen")
+  );
+}
+
 
 function normalizeYesNo(text: string): "yes" | "no" | "maybe" | null {
   const s = text.toLowerCase();
@@ -322,6 +343,46 @@ async function notifyAgentOutbox(
   // 2) Always keep a copy in bot_runs for debugging/training.
   await saveOutboxToBotRuns(supabase, leadId, payload);
 
+  // 2b) Send a direct WhatsApp message to the assigned agent (best-effort).
+  // This makes the handoff actually reach the seller even if no worker is consuming agent_outbox yet.
+  try {
+    const lines: string[] = [];
+    lines.push("Nuevo lead asignado");
+    if (lead?.name) lines.push(`Nombre: ${lead.name}`);
+    if (lead?.phone_e164) lines.push(`Tel: ${lead.phone_e164}`);
+    if (lead?.intent) lines.push(`Intención: ${lead.intent}`);
+    if (lead?.car_query) lines.push(`Busca: ${lead.car_query}`);
+    if (lead?.budget_text) lines.push(`Presupuesto: ${lead.budget_text}`);
+    else {
+      const bMin = lead?.budget_min ? Number(lead.budget_min).toLocaleString("es-AR") : null;
+      const bMax = lead?.budget_max ? Number(lead.budget_max).toLocaleString("es-AR") : null;
+      if (bMin || bMax) lines.push(`Presupuesto: ${[bMin, bMax].filter(Boolean).join(" - ")} ${lead?.budget_currency ?? ""}`.trim());
+    }
+    if (lead?.finance) lines.push(`Financia: ${lead.finance}`);
+    if (lead?.trade_in) lines.push(`Permuta: ${lead.trade_in}`);
+    if (lead?.urgency) lines.push(`Urgencia: ${lead.urgency}`);
+    if (lead?.selected_vehicle) lines.push(`Unidad: ${lead.selected_vehicle}`);
+    if (lastUserText) lines.push(`Último mensaje: ${String(lastUserText).slice(0, 220)}`);
+    lines.push(`Abrir chat: ${payload.action.wa_me_link}`);
+
+    const agentMsg = lines.join("\n");
+    await sendWhatsAppText(String(agent.phone_e164), agentMsg);
+
+    await supabase.from("bot_runs").insert({
+      lead_id: leadId,
+      decision: "notify_agent_whatsapp_sent",
+      extracted: { to: agent.phone_e164 },
+      model_used: process.env.OPENAI_MODEL ?? null,
+    });
+  } catch (e: any) {
+    await supabase.from("bot_runs").insert({
+      lead_id: leadId,
+      decision: "notify_agent_whatsapp_failed",
+      extracted: { error: String(e?.message || e) },
+      model_used: process.env.OPENAI_MODEL ?? null,
+    });
+  }
+
   // 3) Optional timestamps (if columns exist).
   if (inserted) {
     try {
@@ -355,7 +416,7 @@ Reglas:
 - finance y trade_in: "yes"|"no"|"maybe"|null
 - urgency: "low"|"medium"|"high"|null
 - lead_quality: "low"|"medium"|"high"|null
-- wants_catalog true si pide ver autos/opciones/catálogo/modelos o si pregunta "qué tenés".
+- wants_catalog true si pide ver autos/opciones/catálogo/modelos/stock/unidades, o si pregunta "qué tenés", "qué hay", "tenés algo", "mostrame autos".
 `;
 
   const user = `
@@ -507,11 +568,18 @@ export async function runBotForIncomingMessage({
 
   // Explicit handoff
   if (hasAdvisorKeyword(incomingText)) {
-    // If already handed off, don't reassign. Just acknowledge.
+    // If already handed off, don't reassign.
     if (lead0.assigned_agent_id) {
       await supabase.from("leads").update({ conversation_state: "HANDED_OFF", stage: "handed_off" }).eq("id", lead0.id);
       await saveBotRun(supabase, lead0.id, "handoff_keyword_already_assigned");
-      return { decision: "handoff_keyword_already_assigned", replyText: "Dale. Ya hay un asesor asignado, en breve te escribe." };
+
+      const catalogUrl = process.env.CATALOG_URL;
+      const catLine = catalogUrl ? `Catálogo/stock: ${catalogUrl}` : 'Decime "catálogo" y te paso opciones.';
+
+      return {
+        decision: "handoff_keyword_already_assigned",
+        replyText: `Dale. Ya hay un asesor asignado. ${catLine} Si querés también puedo buscar otra unidad o armarte un aproximado de cuotas.`,
+      };
     }
 
     const agent = await pickNextAgent(supabase);
@@ -907,9 +975,31 @@ Simulación aprox.: ${quote.summaryText}` : "");
   // Ready to handoff
   const alreadyAssigned = leadX.assigned_agent_id || leadX.stage === "handed_off" || leadX.conversation_state === "HANDED_OFF";
   if (alreadyAssigned) {
+    // IMPORTANT: don't trap the user in a loop once there's an assigned seller.
+    // Allow the lead to keep exploring stock, ask for quotas, or start a new search.
+    const wantsCatalog = Boolean(extracted?.wants_catalog) || wantsCatalogQuick(incomingText);
+    const wantsSearch = looksLikeNewSearchIntent(incomingText);
+
+    if (wantsCatalog || wantsSearch) {
+      if (missing.includes("budget")) {
+        await supabase.from("leads").update({ conversation_state: "AWAITING_BUDGET" }).eq("id", lead0.id);
+        return { decision: "ask_budget_after_handoff", replyText: "Dale. ¿Qué presupuesto manejás aprox? (ARS o USD)", extracted };
+      }
+      if (missing.includes("car_query")) {
+        await supabase.from("leads").update({ conversation_state: "AWAITING_CAR" }).eq("id", lead0.id);
+        return { decision: "ask_car_after_handoff", replyText: "Perfecto. ¿Qué buscás? Decime 1 o 2 modelos que te gusten.", extracted };
+      }
+
+      const shown = await showOptionsAndStore(supabase, lead0.id, leadX);
+      return { decision: "show_options_after_handoff", replyText: shown.replyText, extracted };
+    }
+
+    const catalogUrl = process.env.CATALOG_URL;
+    const catLine = catalogUrl ? `Catálogo/stock: ${catalogUrl}` : 'Decime "catálogo" y te paso opciones.';
+
     return {
-      decision: "already_handed_off_continue",
-      replyText: "Listo. Ya hay un asesor asignado. Si querés, puedo pasarte más fotos/detalles o armarte un aproximado de cuotas.",
+      decision: "already_handed_off_help",
+      replyText: `Ya hay un asesor asignado. ${catLine} Si querés cuotas, decime por ejemplo: "cuotas 24" (o 12/36/48).`,
       extracted,
     };
   }

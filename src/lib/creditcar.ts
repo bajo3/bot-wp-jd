@@ -126,7 +126,8 @@ function summarize(raw: any): string {
 
 export async function getCreditCarQuote(params: { montoARS: number; modeloYear?: number; term?: number }): Promise<CreditCarQuote | null> {
   const { montoARS } = params;
-  const modeloYear = params.modeloYear ?? new Date().getFullYear();
+  const rawYear = params.modeloYear ?? new Date().getFullYear();
+  const modeloYear = Math.max(2012, Number(rawYear) || 2012);
   const term = params.term;
 
   const url = `https://api.cotizadorcreditcar.com.ar/2?monto=${encodeURIComponent(String(montoARS))}&modelo=${encodeURIComponent(
