@@ -76,6 +76,20 @@ function wantsCatalogQuick(t: string) {
   );
 }
 
+function wantsReset(t: string) {
+  const s = t.toLowerCase();
+  return (
+    s.includes("reiniciar") ||
+    s.includes("reset") ||
+    s.includes("empezar de nuevo") ||
+    s.includes("volver a empezar") ||
+    s.includes("menu") ||
+    s.includes("menú") ||
+    s === "inicio" ||
+    s.includes("cancelar")
+  );
+}
+
 
 function normalizeYesNo(text: string): "yes" | "no" | "maybe" | null {
   const s = text.toLowerCase();
@@ -227,7 +241,7 @@ function missingRequired(lead: LeadRow) {
   return missing;
 }
 
-async function pickNextAgent(supabase: any) {
+async function pickNextAgent(supabase: any, opts?: { excludePhoneE164?: string }) {
   const cursorId = process.env.AGENCY_CURSOR_ID ?? "jesus_diaz";
 
   const { data: agents, error: agentsErr } = await supabase
@@ -239,6 +253,11 @@ async function pickNextAgent(supabase: any) {
   if (agentsErr) throw agentsErr;
   if (!agents?.length) throw new Error("No active agents");
 
+  // If we're testing from a seller's own phone, avoid assigning that same seller to themselves.
+  const exclude = opts?.excludePhoneE164 ? String(opts.excludePhoneE164) : null;
+  const pool = exclude ? agents.filter((a: any) => String(a.phone_e164) !== exclude) : agents;
+  const usable = pool.length ? pool : agents;
+
   const { data: cursor } = await supabase
     .from("agent_assignment_cursor")
     .select("*")
@@ -246,8 +265,8 @@ async function pickNextAgent(supabase: any) {
     .single();
 
   const lastId = (cursor?.last_agent_id as string | null) ?? null;
-  const idx = Math.max(0, agents.findIndex((a: any) => a.id === lastId));
-  const next = agents[(idx + 1) % agents.length];
+  const idx = Math.max(0, usable.findIndex((a: any) => a.id === lastId));
+  const next = usable[(idx + 1) % usable.length];
 
   await supabase
     .from("agent_assignment_cursor")
@@ -366,11 +385,15 @@ async function notifyAgentOutbox(
     lines.push(`Abrir chat: ${payload.action.wa_me_link}`);
 
     const agentMsg = lines.join("\n");
-    await sendWhatsAppText(String(agent.phone_e164), agentMsg);
+
+    // Avoid sending a notification to the same number that's chatting with the bot (common during testing).
+    if (String(agent.phone_e164) !== String(lead.phone_e164)) {
+      await sendWhatsAppText(String(agent.phone_e164), agentMsg);
+    }
 
     await supabase.from("bot_runs").insert({
       lead_id: leadId,
-      decision: "notify_agent_whatsapp_sent",
+      decision: String(agent.phone_e164) !== String(lead.phone_e164) ? "notify_agent_whatsapp_sent" : "notify_agent_whatsapp_skipped_same_number",
       extracted: { to: agent.phone_e164 },
       model_used: process.env.OPENAI_MODEL ?? null,
     });
@@ -544,6 +567,39 @@ export async function runBotForIncomingMessage({
     // ignore reset errors
   }
 
+  // Manual reset (or a fresh "hola") should start a clean flow.
+  // This avoids getting stuck on the same unit (e.g. always showing the last selected vehicle).
+  try {
+    const greetingReset = looksLikeGreetingOnly(incomingText) &&
+      String(lead0.conversation_state) !== "START" &&
+      !isStepAnswerForState(incomingText, lead0.conversation_state);
+
+    if (wantsReset(incomingText) || greetingReset) {
+      const update = {
+        conversation_state: "START",
+        intent: null,
+        budget_min: null,
+        budget_max: null,
+        budget_text: null,
+        budget_currency: null,
+        car_query: null,
+        finance: null,
+        trade_in: null,
+        urgency: null,
+        lead_quality: null,
+        used_vehicle_text: null,
+        last_vehicle_suggestions: null,
+        selected_vehicle: null,
+        selected_vehicle_id: null,
+      } as any;
+
+      await supabase.from("leads").update(update).eq("id", lead0.id);
+      lead0 = { ...lead0, ...update };
+    }
+  } catch {
+    // ignore reset errors
+  }
+
   // Courtesy/ack messages: do not push the flow.
   if (looksLikeThanksOrAck(incomingText)) {
     const base = "¡De nada!";
@@ -556,6 +612,14 @@ export async function runBotForIncomingMessage({
   // When the lead is already handed off, a bare "no" should not trigger a new search/options.
   // Example: "¿Querés link o más fotos?" -> "no".
   if (isHandedOff) {
+    // Even when already handed off, allow quick access to catalog/stock.
+    if (wantsCatalogQuick(incomingText) && process.env.CATALOG_URL) {
+      return {
+        decision: "handed_off_catalog",
+        replyText: `Acá tenés el catálogo/stock: ${process.env.CATALOG_URL}`,
+      };
+    }
+
     const s = incomingText.trim().toLowerCase();
     if (s === "no" || s === "nop" || s === "nope") {
       return {
@@ -582,7 +646,7 @@ export async function runBotForIncomingMessage({
       };
     }
 
-    const agent = await pickNextAgent(supabase);
+    const agent = await pickNextAgent(supabase, { excludePhoneE164: lead0.phone_e164 });
     await supabase
       .from("leads")
       .update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id })
@@ -726,7 +790,7 @@ export async function runBotForIncomingMessage({
       };
     }
 
-    const agent = await pickNextAgent(supabase);
+    const agent = await pickNextAgent(supabase, { excludePhoneE164: lead0.phone_e164 });
     await supabase.from("leads").update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id }).eq("id", lead0.id);
     await tryMarkHandedOff(supabase, lead0.id);
     await notifyAgentOutbox(supabase, agent, lead0, incomingText, { used_vehicle_text: usedText });
@@ -861,7 +925,7 @@ Simulación aprox.: ${quote.summaryText}` : "");
         return { decision: "tradein_added_already_handed_off", replyText: "Dale, lo sumo y el asesor lo tiene en cuenta. ¿Querés que te pase el link de la publicación o más fotos?" };
       }
 
-      const agent = await pickNextAgent(supabase);
+      const agent = await pickNextAgent(supabase, { excludePhoneE164: lead0.phone_e164 });
       await supabase.from("leads").update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id }).eq("id", lead0.id);
 
       await tryMarkHandedOff(supabase, lead0.id);
@@ -1004,7 +1068,7 @@ Simulación aprox.: ${quote.summaryText}` : "");
     };
   }
 
-  const agent = await pickNextAgent(supabase);
+  const agent = await pickNextAgent(supabase, { excludePhoneE164: lead0.phone_e164 });
   await supabase.from("leads").update({ stage: "handed_off", conversation_state: "HANDED_OFF", assigned_agent_id: agent.id }).eq("id", lead0.id);
   await tryMarkHandedOff(supabase, lead0.id);
   await notifyAgentOutbox(supabase, agent, leadX, incomingText);

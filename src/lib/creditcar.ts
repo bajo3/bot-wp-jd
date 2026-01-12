@@ -16,9 +16,49 @@ export type CreditCarQuote = {
 function parseNumberLoose(v: any): number | null {
   if (v === null || v === undefined) return null;
   if (typeof v === "number" && Number.isFinite(v)) return v;
-  const s = String(v).replace(/\./g, "").replace(/,/g, ".").trim(); // handles 521400.00 or 521.400,00
+  // Be careful with separators:
+  // - "521400.00" -> dot is decimal separator
+  // - "521.400" or "52.140.000" -> dots are thousand separators
+  // - "521.400,00" -> dot thousands, comma decimals
+  let s = String(v)
+    .trim()
+    .replace(/\s+/g, "")
+    .replace(/\$/g, "")
+    .replace(/ARS/gi, "")
+    .replace(/\+/g, "");
+
+  const hasDot = s.includes(".");
+  const hasComma = s.includes(",");
+
+  if (hasDot && hasComma) {
+    // Decide by last occurrence.
+    const lastDot = s.lastIndexOf(".");
+    const lastComma = s.lastIndexOf(",");
+    if (lastComma > lastDot) {
+      // 1.234.567,89
+      s = s.replace(/\./g, "").replace(/,/g, ".");
+    } else {
+      // 1,234,567.89
+      s = s.replace(/,/g, "");
+    }
+  } else if (hasComma && !hasDot) {
+    // "521400,00" (decimal) or "521,400" (thousands)
+    const m = s.match(/^(\d+),(\d{1,2})$/);
+    if (m) s = s.replace(/,/g, ".");
+    else s = s.replace(/,/g, "");
+  } else if (hasDot && !hasComma) {
+    // "521400.00" (decimal) or "521.400" (thousands)
+    const m = s.match(/^(\d+)\.(\d{1,2})$/);
+    if (!m) s = s.replace(/\./g, "");
+  }
+
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
+}
+
+function formatARS(n: number): string {
+  const v = Math.round(Number(n) || 0);
+  return v.toLocaleString("es-AR", { maximumFractionDigits: 0 });
 }
 
 function selectOption(raw: any, term?: number): { plazo: number; cuota: number; inclusion?: any } | null {
@@ -92,7 +132,8 @@ function summarize(raw: any): string {
         const tasa = o?.tna ?? o?.tea ?? o?.tasa ?? null;
         const parts = [];
         if (plazo) parts.push(`${plazo} cuotas`);
-        if (cuota) parts.push(`cuota aprox. ${Number(cuota).toLocaleString("es-AR")}`);
+        const cuotaN = parseNumberLoose(cuota);
+        if (cuotaN) parts.push(`cuota aprox. ${formatARS(cuotaN)}`);
         if (tasa) parts.push(`tasa ${tasa}`);
         return `• Opción ${i + 1}: ${parts.filter(Boolean).join(" — ")}`.trim();
       })
@@ -106,7 +147,8 @@ function summarize(raw: any): string {
   if (cuota || plazo) {
     const parts = [];
     if (plazo) parts.push(`${plazo} cuotas`);
-    if (cuota) parts.push(`cuota aprox. ${Number(cuota).toLocaleString("es-AR")}`);
+    const cuotaN = parseNumberLoose(cuota);
+    if (cuotaN) parts.push(`cuota aprox. ${formatARS(cuotaN)}`);
     return parts.join(" — ");
   }
 
@@ -118,7 +160,7 @@ function summarize(raw: any): string {
   if (nums.length) {
     // Pick a mid-ish number to avoid showing extreme totals.
     const pick = nums[Math.min(nums.length - 1, Math.floor(nums.length / 2))];
-    return `Simulación disponible (dato numérico detectado: ${pick.toLocaleString("es-AR")}).`;
+    return `Simulación disponible (dato numérico detectado: ${formatARS(pick)}).`;
   }
 
   return "Simulación disponible.";
@@ -186,7 +228,7 @@ export async function getCreditCarQuote(params: { montoARS: number; modeloYear?:
 
     const selected = selectOption(raw, term);
     const summaryText = selected
-      ? `• ${selected.plazo} cuotas — cuota aprox. ${Math.round(selected.cuota).toLocaleString("es-AR")}`
+      ? `• ${selected.plazo} cuotas — cuota aprox. ${formatARS(selected.cuota)}`
       : summarize(raw);
 
     return {
