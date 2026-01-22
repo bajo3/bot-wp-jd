@@ -1,48 +1,35 @@
-# Jesús Díaz Automotores — WhatsApp Bot (Next.js + Supabase)
+# WhatsApp Bot — bot-wp-jd
 
-Webhook: `POST /api/whatsapp/webhook` y verificación `GET /api/whatsapp/webhook`.
+**Automatización de conversaciones y gestión de leads vía WhatsApp para agencia de autos**
 
-## 1) Instalación
-```bash
-npm i
-cp .env.example .env.local
-npm run dev
-```
+Este bot recibe mensajes desde la API de WhatsApp Cloud y procesa eventos para automatizar notificaciones, derivación de leads y acciones de seguimiento.
 
-## 2) Supabase (SQL)
-Ejecutá en orden:
-- `sql/001_init.sql`
-- `sql/002_seed_agents.sql`
- - `sql/003_exchange_rates.sql` (cache Dólar Blue)
- - `sql/004_followups.sql` (seguimiento automático)
- - `sql/005_leads_vehicle_context.sql` (memoria de sugerencias / selección)
- - `sql/006_leads_handoff_and_used.sql` (reset por inactividad + usados)
- - `sql/007_agent_outbox.sql` (outbox para notificar vendedores)
+## 🚀 Qué hace
+- Escucha mensajes entrantes desde un webhook
+- Procesa lógica de negocio para leads
+- Integra con base de datos para seguimiento
+- Permite notificar automáticamente a vendedores
 
-> Importante: el bot usa tu tabla real `public.vehicles` (según el dump que me pasaste) con columnas:
-> `id, title, brand, model, year, price, currency, pictures, permalink, km/Km, status`.
-> Por defecto filtra `status in ('available','active')`.
-> Si querés filtrar por agencia/tenant, seteá `DEALERSHIP_ID` en `.env.local` y se filtra por `dealership_id`.
+## 🧠 Stack tecnológico
+- **TypeScript**
+- **Next.js**
+- **Supabase (SQL)**
+- Webhooks y API REST
 
-## 3) WhatsApp Cloud API
-- Configurá el webhook en Meta apuntando a:
-  - `https://TU-DOMINIO/api/whatsapp/webhook`
-- Usá `META_VERIFY_TOKEN` para la verificación.
-- (Recomendado) completá `META_APP_SECRET` para validar `X-Hub-Signature-256`.
+## 🚀 Demo / Deploy
+🔗 https://bot-wp-jd.vercel.app
 
-## 3.1) Precios ARS/USD (Dólar Blue)
-El bot soporta presupuestos en ARS o USD y normaliza todo a ARS usando **Dólar Blue (venta)**.
+## 🛠️ Cómo probar
+1. Clonar el repo  
+2. `npm install`  
+3. Copiar `.env.example` a `.env.local`  
+4. Configurar tus keys de WhatsApp Cloud API  
+5. `npm run dev`
 
-- Cachea la cotización en `public.exchange_rates` por 120 minutos (configurable con `DOLAR_CACHE_MINUTES`).
-- Para conversiones usa **redondeo hacia arriba**.
+## 📌 ¿Por qué es útil?
+Automatiza tareas repetitivas de atención y derivación de leads, ahorrando tiempo de gestión manual y mejorando la eficiencia en la comunicación.
 
-## 4) Derivación (round-robin)
-Cuando el bot decide derivar:
-- asigna el lead a un agente (tabla `agents`)
-- encola el resumen en `agent_outbox` (status `pending`) y también guarda una copia en `bot_runs` (decision `notify_agent_outbox`)
+## 🧩 Próximos pasos
+- Mejorar manejo de sesiones
+- Guardar métricas de interacción
 
-El vendedor, por ahora, le escribe al cliente desde su WhatsApp personal usando el link `wa.me`.
-
-Si querés que el bot *también* le mande el resumen al vendedor por WhatsApp, vas a necesitar:
-- que el vendedor haya dado opt-in al número del bot, y
-- respetar ventana 24h o usar Message Templates.
